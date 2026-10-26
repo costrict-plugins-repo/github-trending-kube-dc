@@ -1,0 +1,131 @@
+# TLS Passthrough Example
+# For services that handle their own TLS termination (e.g., Kubernetes API servers)
+#
+# This is useful when:
+# - Your application must terminate TLS itself
+# - You need end-to-end encryption
+# - You're exposing a Kubernetes API server
+#
+# This example uses automatic route creation via service annotations.
+# The controller will automatically create:
+# - EIP (external IP allocation)
+# - Backend (for Gateway routing)
+# - TLSRoute (with SNI-based routing on port 443)
+#
+# Auto-generated hostname format: {service}-{namespace}.{base_domain}
+# Example: my-api-server-demo.stage.kube-dc.com
+#
+# Prerequisites:
+# - Project with cloud networking (egressNetworkType: cloud)
+# - Your app handles TLS termination
+#
+# Usage:
+#   kubectl apply -f 04-tls-passthrough.yaml
+#
+# Test:
+#   curl -k https://my-api-server-{namespace}.{base_domain}
+---
+# Nginx config for TLS termination
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-api-server-nginx-conf
+data:
+  default.conf: |
+    server {
+        listen 443 ssl;
+        ssl_certificate /etc/nginx/ssl/tls.crt;
+        ssl_certificate_key /etc/nginx/ssl/tls.key;
+        
+        location / {
+            return 200 'TLS Passthrough Works!\n';
+            add_header Content-Type text/plain;
+        }
+    }
+---
+# Self-signed certificate (for demo - use cert-manager in production)
+# In production, use cert-manager with your own dns01 or CA Issuer
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-api-server-tls
+type: kubernetes.io/tls
+stringData:
+  tls.crt: |
+    -----BEGIN CERTIFICATE-----
+    # Replace with your actual certificate
+    -----END CERTIFICATE-----
+  tls.key: |
+    -----BEGIN PRIVATE KEY-----
+    # Replace with your actual private key
+    -----END PRIVATE KEY-----
+---
+# Sample TLS-terminating application
+# This example uses nginx with self-signed cert
+# Replace with your actual TLS-terminating application
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-api-server
+  labels:
+    app: my-api-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: my-api-server
+  template:
+    metadata:
+      labels:
+        app: my-api-server
+    spec:
+      containers:
+      - name: nginx-ssl
+        image: nginx:alpine
+        ports:
+        - containerPort: 443
+          name: https
+        volumeMounts:
+        - name: tls
+          mountPath: /etc/nginx/ssl
+          readOnly: true
+        - name: nginx-conf
+          mountPath: /etc/nginx/conf.d
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+      volumes:
+      - name: tls
+        secret:
+          secretName: my-api-server-tls
+      - name: nginx-conf
+        configMap:
+          name: my-api-server-nginx-conf
+---
+# LoadBalancer Service with automatic TLS passthrough route
+# The controller will auto-create: EIP, Backend, and TLSRoute
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-api-server
+  annotations:
+    # Automatically expose via TLS passthrough route
+    # Creates: Backend + TLSRoute with SNI-based routing
+    # Gateway passes encrypted traffic to app (app terminates TLS)
+    service.nlb.kube-dc.com/expose-route: "tls-passthrough"
+    
+    # Optional: Custom hostname (overrides auto-generated)
+    # service.nlb.kube-dc.com/route-hostname: "api.example.com"
+    
+    # Optional: Specific port for multi-port services
+    # service.nlb.kube-dc.com/route-port: "6443"
+spec:
+  type: LoadBalancer
+  selector:
+    app: my-api-server
+  ports:
+  - name: https
+    port: 6443
+    targetPort: 443
+    protocol: TCP

@@ -1,0 +1,1199 @@
+// Package clusterinit owns the typed `InitOptions` struct and the
+// validation rules for `kube-dc bootstrap init`. The cobra command in
+// `cli/cmd/kube-dc/bootstrap_init.go` binds CLI flags onto an
+// `InitOptions`, calls `Validate`, and then hands the value to the
+// engine slices (M4-T03..T13) for execution.
+//
+// **Why this isn't `package init`** — the plan (installer-agentic-
+// implementation-plan §9) calls the directory `init/`, but `init` is a
+// predeclared Go identifier (`init() func()` runs at package load) and
+// the Go style guide explicitly advises against using it as a package
+// name. `clusterinit` is unambiguous, descriptive, and follows the
+// sibling pattern (`discover`, `doctor`, `breakglass`).
+//
+// **Scope of M4-T01** (this file): the struct shape + validation
+// framework that the cobra surface depends on. Preset → env mapping is
+// M4-T04; auto mode detection is M4-T03; plan rendering is M4-T02;
+// scaffold + commit + flux are M4-T10..T12. Engine wiring lands as
+// those slices ship.
+package clusterinit
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"net/mail"
+	"regexp"
+	"sort"
+	"strings"
+)
+
+// Preset selects the network topology defaults — drives M4-T04's
+// preset → env mapping. The four values mirror installer-prd §3.2.
+type Preset string
+
+const (
+	PresetInternalOnly    Preset = "internal-only"
+	PresetCloudVLAN       Preset = "cloud-vlan"
+	PresetCloudPublicVLAN Preset = "cloud+public-vlan"
+	PresetCustom          Preset = "custom"
+)
+
+// AllPresets is the validation set + the help-text enumeration. Sorted
+// alphabetically for stable cobra output.
+var AllPresets = []Preset{
+	PresetCloudPublicVLAN, PresetCloudVLAN, PresetCustom, PresetInternalOnly,
+}
+
+// Mode is the high-level "what is `init` doing here" decision per
+// installer-prd §4.1.1. M4-T03 will auto-detect when the operator
+// doesn't pass `--mode`; M4-T01 surfaces the flag only.
+type Mode string
+
+const (
+	// ModeAuto means "let the CLI infer from probe results" — the
+	// default when --mode is not passed. T03's detector picks
+	// install/adopt/resume; until T03 lands, an explicit value is
+	// required.
+	ModeAuto    Mode = "auto"
+	ModeInstall Mode = "install"
+	ModeAdopt   Mode = "adopt"
+	ModeResume  Mode = "resume"
+)
+
+var AllModes = []Mode{ModeAdopt, ModeAuto, ModeInstall, ModeResume}
+
+// FleetMode decides how the CLI relates to the kube-dc-fleet git repo.
+type FleetMode string
+
+const (
+	// FleetNewRepo creates a brand-new fleet repo on GitHub (the
+	// greenfield day-1 path).
+	FleetNewRepo FleetMode = "new-repo"
+	// FleetExistingFleet adds a cluster to an existing fleet repo with
+	// sibling clusters already enrolled (atlantis's path).
+	FleetExistingFleet FleetMode = "existing-fleet"
+	// FleetExistingRepo adopts an existing repo that doesn't yet have
+	// kube-dc-fleet structure (greenfield-ish; rare).
+	FleetExistingRepo FleetMode = "existing-repo"
+)
+
+var AllFleetModes = []FleetMode{FleetExistingFleet, FleetExistingRepo, FleetNewRepo}
+
+// RookMode selects the object-storage backend strategy. The canonical
+// CLI surface is `--object-storage-mode` (OS-1; `--rook-mode` is a
+// deprecated alias for one release) — the Go type keeps its legacy
+// name to avoid a rename ripple until OS-2.
+//
+// The six values mirror `kube-dc-fleet/infrastructure/object-storage/
+// modes/` one-to-one (see docs/prd/installer-object-storage-scaffold.md
+// §1.1). Disposition: the three rook-* modes are LIVE — the OS-2
+// scaffold writer (objectstorage.go) wires the overlay + Flux layer +
+// platform dependsOn + env keys at apply; external-ceph + external-s3
+// are stub modes fleet-side (README-only kustomizations) and fail
+// closed; `disabled` is allowed with a loud plan warning (platform
+// monitoring cannot converge without the system S3 buckets — OS-4
+// tracks the fleet-side disable mechanism).
+type RookMode string
+
+const (
+	RookDisabled      RookMode = "disabled"
+	RookCephLocal     RookMode = "rook-ceph-local"
+	RookCephMultiNode RookMode = "rook-ceph-multi-node"
+	// RookCephPVC backs OSDs with PVCs from an existing StorageClass —
+	// the CSI-cloud shape (eu/dc1 + eu/dc2 run this in production).
+	// Was missing from the enum until the 2026-07-04 provenance pass.
+	RookCephPVC      RookMode = "rook-ceph-pvc"
+	RookExternalCeph RookMode = "external-ceph"
+	RookExternalS3   RookMode = "external-s3"
+)
+
+var AllRookModes = []RookMode{
+	RookCephLocal, RookCephMultiNode, RookCephPVC, RookDisabled, RookExternalCeph, RookExternalS3,
+}
+
+// InitOptions is the typed payload the engine (M4-T03..T13) consumes.
+// One field per flag in installer-agentic-implementation-plan §9.M4-T01.
+//
+// Zero-value safety: every field has a sensible zero (empty slice, "",
+// 0, false). The cobra binding fills in defaults that differ from
+// zero (e.g. FleetMode defaults to ExistingFleet for
+// atlantis-shape installs). RookMode deliberately has NO
+// default (OS-1) — empty fails Validate with
+// ErrObjectStorageModeRequired.
+//
+// Secret material: GitHubToken is the only sensitive field. It is
+// NEVER logged. The cobra surface accepts it as a flag for CI
+// convenience, but the production path is `gh auth token` resolution
+// inside the engine — operators in TTY sessions should not pass it on
+// the command line at all.
+type InitOptions struct {
+	// --- Topology ---
+	Preset Preset
+	Mode   Mode
+	// RequestedMode is what the OPERATOR asked for, preserved even after
+	// ResolveMode substitutes a concrete verdict into Mode. It exists because
+	// "auto" and "the mode auto happened to pick" are different facts, and
+	// anything persisted or replayed later (--save-config, a TUI draft, a
+	// saved plan) must carry the request, not the verdict: a spec that froze
+	// `install` reads back as an explicit operator decision on the NEXT run,
+	// against whatever cluster the kubeconfig then points at, skipping every
+	// safeguard that exists for auto. Empty means "same as Mode".
+	RequestedMode  Mode
+	Name           string
+	Domain         string
+	NodeExternalIP string
+	Email          string
+
+	// --- Fleet ---
+	FleetMode FleetMode
+	Repo      string
+	// Provider selects the remote-repo hosting service for M4-T05
+	// auto-create + push. Empty defaults to GitHub for backward
+	// compatibility with pre-multi-provider callers; explicit
+	// values are "github" or "gitlab" (see clusterinit.Provider).
+	// The GitHubOwner/GitHubRepo/GitHubToken field names are kept
+	// as-is for backward compat — they hold the owner/name/token
+	// for the SELECTED provider, not necessarily GitHub. A future
+	// slice may rename them to Owner/Name/Token; today they're
+	// spelled github-* at the CLI surface because that's what
+	// existing operators muscle-memory.
+	Provider    Provider
+	GitHubOwner string
+	GitHubRepo  string
+	GitHubToken string // never logged
+
+	// --- Overrides (repeatable flags) ---
+	// Sets stores `--set KEY=VALUE` deltas applied on top of the
+	// preset's env map. Engine validates against the preset's
+	// allow-list at apply time.
+	Sets map[string]string
+	// NodeNICs maps cluster node name → primary NIC iface for the
+	// customInterfaces patch (M4-T11). `--node-nic host5-a=enp1s0`.
+	NodeNICs map[string]string
+
+	// --- Object storage (OS-1; canonical flag --object-storage-mode) ---
+	// RookMode is REQUIRED — no default. The old silent
+	// default-to-disabled produced clusters whose monitoring layer
+	// could never converge (Mimir/Loki hard-require the system S3
+	// buckets); `disabled` must now be an explicit operator decision.
+	RookMode RookMode
+	// rook-ceph-local companions → CEPH_LOCAL_OSD_{NODE,SIZE_GB,DEVICE}.
+	RookOSDNode   string
+	RookOSDSizeGB int
+	RookOSDDevice string // optional; fleet template defaults to loop0
+	// CephNodes maps one to three server names to raw OSD devices.
+	// Generated patches size the Fleet template to the selected topology.
+	CephNodes map[string]string
+	// rook-ceph-pvc companions → CEPH_OSD_{STORAGE_CLASS,COUNT,
+	// VOLUME_SIZE_GB}. Count/size 0 = fleet template defaults (2/200).
+	CephStorageClass    string
+	CephOSDCount        int
+	CephOSDVolumeSizeGB int
+	// Shared by every non-disabled mode. Empty S3Hostname = the
+	// fleet convention s3.<domain>; NoS3Exposure omits the exposure/
+	// layer (Certificate + HTTPRoute) — the eu/dc2 pattern.
+	S3Hostname   string
+	NoS3Exposure bool
+	// NoKubeVirt marks a cluster where VMs are out of scope (e.g. cs/CloudSigma,
+	// where KubeVirt ships but is unused). Skips the KubeVirt-eligibility (KVM)
+	// preflight so the install is not blocked/warned on nodes that will never run
+	// VMs.
+	NoKubeVirt bool
+
+	// Greenfield managed services are a reviewed installer choice. Empty fields
+	// are tolerated by older internal callers until the CLI input gate resolves
+	// them; the Fleet scaffold itself requires an explicit installation kind.
+	InstallationKind        string
+	ManagedServicesMode     string // auto (default), on, off
+	ServicesDatabaseClass   string
+	ServicesStorageBudget   string
+	ServicesEgressProbeURLs []string
+	// Verified from the live target cluster for an explicit class. The
+	// observation is transient; the resolved plan mode still records its effect.
+	ServicesClassExpansionVerified bool
+
+	// --- VM root-disk storage (PRD docs/prd/vm-storage-mode.md) ---
+	// OPTIONAL, default `local` (unlike RookMode, omitting it never
+	// fails Validate). local-path stays the VM default in every mode.
+	// The shared-rbd modes require an object-storage mode that provides
+	// the rbd-pool CephBlockPool (the rook-ceph-* modes) — verified,
+	// never created. See VMStorageMode / vmstorage.go.
+	VMStorageMode VMStorageMode
+	// VMGoldens is the selected FS golden subset for shared-rbd
+	// (`--vm-golden debian-12,alpine-3.21`). Empty = one containerdisk
+	// default (defaultVMGolden). Never all-by-default; Windows opt-in.
+	VMGoldens []string
+	// VMGoldensBlock is the selected Block (live-migration) golden set —
+	// carried for forward-compat; live-migration is installer-deferred.
+	VMGoldensBlock []string
+
+	// ImageAcceleration wires the on-cluster image path (tenant-addons,
+	// cdi-os-mirror, registry-depot — see imageaccel.go) into the scaffold.
+	// Default TRUE for new clusters (`--image-acceleration=false` opts out);
+	// pieces missing from an older starter are skipped with a warning.
+	// Spegel (the RKE2 embedded registry) is independent: bootstrap install
+	// enables it per node.
+	ImageAcceleration bool
+
+	// PrefillNotes carries operator-facing notices produced while importing a
+	// config/spec — currently legacy-key translations (e.g. INGRESS_MODE →
+	// --ingress-address-layer). Transient OUTPUT, never an input: it must not
+	// participate in the plan hash.
+	PrefillNotes []string
+
+	// --- Front door (docs/prd/ingress-mode-hostnetwork-design.md §5a) ---
+	// ControlPlaneNodes are the real control-plane node NAMES, resolved from the
+	// live cluster by the cobra layer when one is reachable. Empty means
+	// "unknown", which makes the placement checks stand down rather than guess —
+	// an operator who has not told us must not be blocked by a rule we cannot
+	// evaluate. Never populated from KUBE_OVN_GW_NODES: the gateway set is a
+	// DIFFERENT set (the reference cluster has a gateway node that is an ordinary
+	// worker), and substituting it inverts every placement conclusion.
+	ControlPlaneNodes []string
+
+	// IngressAddressLayer picks WHO OWNS the address clients dial:
+	// "none" (the ingress nodes' own IPs; MetalLB not installed),
+	// "metallb-l2" or "metallb-bgp" (a MetalLB-owned floating VIP).
+	// The DATA PLANE does not vary WITH THIS CHOICE — the same Envoy
+	// serves the same traffic on every layer — so this is the only
+	// front-door choice. (It is a 3-replica Deployment today; the
+	// reusable host-bind component is opt-in per cluster and the
+	// DaemonSet variant stays inert. Nothing here promises either.)
+	// an operator makes.
+	IngressAddressLayer string
+	// IngressNodes are the nodes that will carry the ingress label and
+	// therefore bind :80/:443. Empty = the CLI suggests the gateway set.
+	// With a VIP layer these nodes must ALSO run a MetalLB speaker and
+	// reach the VIP's segment (design §5a A1) or the VIP is
+	// unannounceable.
+	IngressNodes []string
+
+	// --- Platform TLS (docs/platform/certificates.md) ---
+	// TLSMode selects who issues the platform certificates: "acme" (default,
+	// cert-manager via the ACME ClusterIssuer) or "byo-wildcard" (operator-
+	// supplied wildcard, SOPS-committed, ACME Certificates suppressed).
+	// TLSCert/TLSKey are LOCAL paths to the material; they are read once,
+	// validated (pair match, chain order, EKU, validity window, the *.<domain>
+	// SAN), and never stored in the plan or logs — only the SOPS artifact
+	// carries them, and only encrypted.
+	TLSMode string
+	TLSCert string
+	TLSKey  string
+	// TLSCertFingerprint is NOT a flag: the RunE preflight stamps the hex
+	// SHA-256 of the validated leaf certificate here so the PLAN carries the
+	// identity of the certificate the operator reviewed. Apply re-loads the
+	// material and refuses a fingerprint mismatch — without this, a
+	// different-but-also-valid pair could ship under the reviewed plan hash.
+	TLSCertFingerprint string
+	// --- acme-dns01-route53 solver config (dns01.go) ---
+	// ZoneID/Region/AccessKeyID are configuration, not secrets — they land in
+	// the ClusterIssuer patch in cleartext. The secret access key never has a
+	// field here: it is read at load time from --dns01-route53-secret-key-file
+	// or the KUBE_DC_DNS01_ROUTE53_SECRET_KEY environment variable and
+	// only ever ships SOPS-encrypted.
+	DNS01Route53ZoneID        string
+	DNS01Route53Region        string
+	DNS01Route53AccessKeyID   string
+	DNS01Route53SecretKeyFile string
+	// DNS01SecretKeyFingerprint is NOT a flag: stamped by the RunE preflight
+	// (hex SHA-256 of the validated secret key) so the plan binds the exact
+	// credential, mirroring TLSCertFingerprint.
+	DNS01SecretKeyFingerprint string
+	// --- acme-dns01-cloudflare solver config (dns01_cloudflare.go) ---
+	// Zone (apex the token is scoped to; optional in the dedicated mode, the
+	// explicit opt-in with --tls-mode=acme = wildcards only) and Scope
+	// (derived from the mode: all | wildcard, persisted as
+	// DNS01_CLOUDFLARE_SCOPE) are configuration. The API token never has a
+	// field here: it is read at load time from --dns01-cloudflare-api-token-file
+	// or the KUBE_DC_DNS01_CLOUDFLARE_API_TOKEN environment variable and only
+	// ever ships SOPS-encrypted.
+	DNS01CloudflareZone         string
+	DNS01CloudflareScope        string
+	DNS01CloudflareAPITokenFile string
+	// DNS01CloudflareTokenFingerprint is NOT a flag: stamped by the RunE
+	// preflight (hex SHA-256 of the validated token) so the plan binds the
+	// exact credential, mirroring DNS01SecretKeyFingerprint.
+	DNS01CloudflareTokenFingerprint string
+	// TrustedCABundle is a local certificate-only PEM path. Its validated
+	// canonical fingerprint is plan-pinned; the public CA material is written
+	// to a ConfigMap, never to a Secret.
+	TrustedCABundle      string
+	TrustedCAFingerprint string
+
+	// --- Accelerators (GPU PRD section 6) ---
+	// This surface is deliberately non-secret. Licenses, registry credentials,
+	// and portal tokens stay in the SOPS workflow; VGPUSecretReady is only a
+	// readiness acknowledgement.
+	GPUPlatform          GPUPlatformMode
+	GPUDriverSource      GPUDriverSource
+	GPUOperatorVersion   string
+	NVIDIADriverVersion  string
+	NVIDIAToolkitVersion string
+	HAMiEnabled          bool
+	GPUSharedAllocator   GPUSharedAllocator
+	HAMiVersion          string
+	HAMiSchedulerVersion string
+	GPUNodeModes         map[string]GPUNodeMode
+	GPUProfiles          []string
+	AllowUnassignedGPUs  bool
+	VGPUSecretReady      bool
+
+	// PAYG opts this installation into Kube-DC's pay-as-you-go usage
+	// billing (`--payg`, default off). The scaffold then writes the
+	// platform/payg Flux layer, PAYG_ENABLED=true, a freshly generated
+	// PAYG_INSTALLATION_UID, the products revision, the metering database
+	// login (SOPS) and its CNPG role — see payg.go. A dedicated typed flag,
+	// not `--addon=payg`: --addon fails closed (ErrAddonsNotImplemented) and
+	// PAYG is not an addons.yaml layer — it flips a chart value and mints an
+	// installation identity. Requires BILLING_PROVIDER stripe or whmcs;
+	// refused for installations billed by a partner.
+	PAYG bool
+
+	// --- Addons ---
+	// Addons is the de-duplicated list of `--addon` values.
+	// Validated against the registry (metallb, sso-google,
+	// stripe-billing, velero) at apply time.
+	Addons []string
+
+	// --- Behaviour gates ---
+	AllowDNSNotReady bool
+	// AllowNoKubevirtEligible lets Apply proceed on a cluster whose
+	// NFD state reports zero kube-dc.com/kubevirt-eligible=true
+	// nodes. Default false — M6-T05 NFD gate refuses on 0 count
+	// because kube-dc's product surface assumes VMs. Operators who
+	// install kube-dc without needing VM workloads (multi-tenancy /
+	// GitOps only) opt in.
+	AllowNoKubevirtEligible bool
+	// AllowUnpinnedAdopt downgrades the --mode=adopt safety gate from a
+	// hard failure to a warning. That gate (CheckAdoptPinned) consumes
+	// the resolved adopt plan: it re-runs adopt.PinVersions against the
+	// live cluster + cluster-config.env and refuses to install when a
+	// pre-existing component would drift (Flux's first reconcile would
+	// upgrade/restart it) or is undetected. Default false — the operator
+	// is expected to run `bootstrap adopt <cluster> --pin-versions` first;
+	// this flag is the lab/dev escape.
+	AllowUnpinnedAdopt bool
+	SSHHostKeySHA256   string
+	SSHHost            string
+	PrimaryNode        string
+	NodeSSHHosts       map[string]string
+	NodeSSHHostKeys    map[string]string
+	NoSSH              bool
+	// NoOIDCCutover skips the finalize step that points every
+	// kube-apiserver at the OIDC webhook. Default false — the cutover is
+	// part of a normal install, because a cluster without it looks
+	// completely healthy and rejects every Keycloak login, and four
+	// clusters shipped that way while it was a separate command.
+	//
+	// The escape exists for control planes whose apiserver manifests are
+	// owned by something else (a config-management system, an air-gapped
+	// image, a distro that is not RKE2): there the CLI editing the manifest
+	// in place would be reverted or would fight the owner. Those operators
+	// wire the flags themselves; `bootstrap accept` still verifies the
+	// result, so skipping the automation never means skipping the check.
+	NoOIDCCutover    bool
+	NoInstallPrereqs bool
+	NoCreateRepo     bool
+	// StarterRef overrides the fleet-starter OCI artifact pulled into
+	// --repo when the shared fleet trees are absent (greenfield
+	// new-repo/existing-repo modes). Empty = the cobra layer resolves
+	// oci://ghcr.io/kube-dc/fleet-starter:<cli-version> (or :latest for
+	// dev builds). A checkout that already has the shape skips the pull
+	// entirely, whatever this is set to.
+	StarterRef       string
+	MirrorRegistry   string
+	BundlePullSecret string
+	OpenBaoSharesOut string
+
+	// --- Plan/apply flow (M4-T02) ---
+	DryRun    bool
+	PlanFile  string
+	ApplyPlan string
+	NoPush    bool
+	NoTTY     bool
+	Yes       bool
+
+	// AccessSummary is a TRANSIENT OUTPUT (never a plan input): the
+	// post-apply phase fills it with the end-of-install access block
+	// (Keycloak admin URL + password + SSO URLs). The cobra layer
+	// prints it to the real terminal AFTER the install screen closes,
+	// so the Keycloak admin password reaches the operator but never
+	// the redacted transcript. Excluded from the plan hash
+	// (hashExcludedFields).
+	AccessSummary string
+}
+
+// --- Errors ---
+
+// ErrValidation is returned by Validate when one or more rules fail.
+// Use errors.Is to match; the wrapped message lists every failure on
+// a single line so cobra's stderr render stays compact.
+var ErrValidation = errors.New("init: invalid options")
+
+// ErrApplyGate is returned by Validate when --no-tty is set without
+// one of --yes / --apply-plan / --dry-run. Distinct error so the
+// cobra layer can surface the three options as a help block.
+var ErrApplyGate = errors.New("init: --no-tty requires --yes, --apply-plan, or --dry-run")
+
+// ErrFleetModeNewRepo is returned when an apply-path fleet-mode
+// (new-repo OR existing-fleet without `--no-push`) is set without
+// --github-owner + --github-repo. The error message lists
+// the two missing flags.
+var ErrFleetModeNewRepo = errors.New("init: apply-path fleet modes require --github-owner and --github-repo (used by flux-install.sh to point Flux at the right remote)")
+
+// ErrUnknownProvider is returned when --provider is set to a value
+// other than "github" or "gitlab". Empty is valid (defaults to
+// GitHub); anything else is a typo or a future provider the
+// operator's binary doesn't know about.
+var ErrUnknownProvider = errors.New("init: --provider must be `github` or `gitlab`")
+
+// ErrFleetModeExistingRepo is returned when --fleet-mode=existing-fleet
+// is set without a resolvable --repo. Empty repo in existing-fleet
+// mode would otherwise silently produce a misleading plan with an
+// empty "Prior clusters" list (M4-T01+T02 review-pass — P2/P3).
+var ErrFleetModeExistingRepo = errors.New("init: --fleet-mode=existing-fleet requires --repo to point at the fleet repo")
+
+// ErrModeAutoUnresolved is the safety-net error that fires when
+// Validate sees `ModeAuto`. The cobra layer is supposed to call
+// `ResolveMode` BEFORE Validate (M4-T03 wired this in
+// `bootstrap_init.go:resolveAutoMode`), so seeing ModeAuto here
+// means either:
+//
+//   - A future refactor dropped the resolve step from cobra's RunE.
+//   - A caller constructed InitOptions programmatically without
+//     running ResolveMode (e.g. a unit test that should be using
+//     ModeInstall directly instead of going through auto).
+//
+// Surfacing this loudly via Validate prevents BuildPlan from ever
+// receiving an unresolved Mode and silently rendering plans with
+// "auto" in the header.
+//
+// Naming note: this used to be `ErrModeAutoNotImplemented` while
+// M4-T03 was pending. The error name is exported so external
+// callers may have errors.Is checks; if you're seeing this in a
+// downstream module, the new name is the documented sentinel.
+var ErrModeAutoUnresolved = errors.New("init: ModeAuto reached Validate unresolved — cobra must call ResolveMode first; programmatically: pass --mode=install|adopt|resume explicitly")
+
+// ErrModeAutoNotImplemented is the deprecated alias for
+// ErrModeAutoUnresolved. Kept for one release so external errors.Is
+// checks don't break in the cobra-layer review-pass window. Remove
+// in v0.5.
+//
+// Deprecated: use ErrModeAutoUnresolved.
+var ErrModeAutoNotImplemented = ErrModeAutoUnresolved
+
+// ErrAddonsNotImplemented fails `--addon` closed. The flag, the
+// `allowedAddons` registry, `validateAddons`, and the `inputsForHash`
+// participation are all in place, but NOTHING in the apply path
+// consumes `o.Addons` yet — `bootstrap/add-cluster.sh` scaffolds no
+// addon files and no deferred step applies them. Rather than accept a
+// flag that validates + hashes + renders but does nothing (a
+// truth-in-advertising bug surfaced by the 2026-07-04 E2E shakedown),
+// Validate refuses any non-empty --addon until the addon engine slice
+// ships. The message points at the manual path so operators aren't
+// stuck: hand-author `clusters/<name>/addons.yaml` (see the live
+// siblings, e.g. clusters/atlantis/addons.yaml, for the
+// Kustomization shape).
+//
+// When the addon slice lands, delete this sentinel + the guard in
+// Validate and wire the rendering hook — the registry + hash plumbing
+// is deliberately kept so that's the only change needed.
+var ErrAddonsNotImplemented = errors.New("init: --addon is not yet wired into apply (the flag validates but scaffolds nothing); omit it and hand-author clusters/<name>/addons.yaml post-install — see clusters/atlantis/addons.yaml for the shape")
+
+// ErrObjectStorageModeRequired fires when --object-storage-mode is
+// unset. There is deliberately NO default: object storage is
+// load-bearing for the platform layer (Mimir + Loki HelmReleases
+// hard-consume the system OBC ConfigMap/Secret pairs via valuesFrom,
+// no optional:true), so the old silent default-to-disabled shipped
+// clusters whose monitoring could never converge. `disabled` is still
+// available — but only as an explicit choice. The cobra layer enriches
+// this error with the template sibling's mode as a hint in
+// existing-fleet runs (design call 2026-07-04: hint, never inherit).
+var ErrObjectStorageModeRequired = errors.New("init: --object-storage-mode is required (one of rook-ceph-local|rook-ceph-multi-node|rook-ceph-pvc|disabled; object storage is load-bearing — Mimir/Loki/Velero and tenant buckets depend on it)")
+
+// ErrObjectStorageModeStub fails the two external modes closed.
+// Their fleet-side kustomizations are README-only stubs
+// (infrastructure/object-storage/modes/external-{ceph,s3}/) —
+// scaffolding them would produce an infra-object-storage layer that
+// "reconciles" while providing nothing, leaving Mimir/Loki dead with
+// no error anywhere. Unlike the rook-* modes this is not an OS-2
+// wiring gap: it stays closed until the fleet manifests are authored
+// against a real upstream (see the per-mode README fleet-side).
+var ErrObjectStorageModeStub = errors.New("init: this object-storage mode is a fleet-side stub (no manifests exist yet); provide S3 out-of-band and hand-author clusters/<name>/object-storage/ — see infrastructure/object-storage/modes/<mode>/README.md")
+
+// ErrVMStorageNeedsRookRBDPool fails the shared-rbd VM-storage modes
+// closed when the object-storage mode cannot provide the rbd-pool
+// CephBlockPool. The rbd-vm StorageClass binds pool=rbd-pool, which is
+// shipped by the rook-ceph-* object-storage modes only (verified, never
+// created by the installer — PRD §2.2). `disabled` / `external-*` don't
+// provide it, so a shared-rbd VM disk would never provision.
+var ErrVMStorageNeedsRookRBDPool = errors.New("init: --vm-storage-mode=shared-rbd requires an object-storage mode that provides the rbd-pool CephBlockPool (rook-ceph-local|rook-ceph-multi-node|rook-ceph-pvc)")
+
+// NOTE (OS-2): the former ErrObjectStorageScaffoldNotImplemented
+// fail-closed sentinel for the rook-* modes was deleted when the
+// scaffold writer shipped (objectstorage.go) — the three rook modes
+// now write the full wiring (overlay + Flux layer + platform
+// dependsOn + env keys) during apply. It never appeared in a released
+// binary (OS-1 and OS-2 shipped in the same cycle), so no deprecation
+// alias is kept.
+
+// --- Validation ---
+
+// clusterNameRegex permits the same shape `add-cluster.sh` accepts —
+// lowercase + digits + `-` + `/` (the eu/dc1 nested overlay pattern).
+// Refuses leading/trailing `/` and `--`.
+var clusterNameRegex = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:/[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$`)
+
+// ValidClusterName uses the same Fleet path contract as InitOptions.Validate.
+func ValidClusterName(name string) bool { return clusterNameRegex.MatchString(name) }
+
+// domainRegex is a permissive FQDN check — at least one dot, valid
+// label chars. Not RFC-1035-perfect, but rejects obvious typos like
+// `https://foo.example` (we want the host only) and dotted IPs.
+//
+// The last label must start with a letter and be at least two
+// characters, but it MAY contain digits and interior hyphens: private
+// enterprise zones such as `kubedc.diia-dcir` or `corp.site-01` are valid
+// DNS names (RFC 1035 allows hyphens inside any label), and a letters-only
+// TLD rule rejected them at `bootstrap install --domain` (diia, 2026-09-08).
+var domainRegex = regexp.MustCompile(`^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z](?:[a-z0-9-]*[a-z0-9])$`)
+
+// Validate runs every cobra-time check and returns ErrValidation
+// wrapping the combined failures, ErrApplyGate, or ErrFleetModeNewRepo
+// (whichever fires first by category).
+//
+// Validation is split into "structural" (the flag values make sense
+// in isolation) and "cross-flag" (combinations are coherent).
+// Structural runs first because cross-flag rules depend on parsed
+// values.
+func (o *InitOptions) Validate() error {
+	if err := ValidateSSHHostKeyField(o.SSHHostKeySHA256); err != nil {
+		return err
+	}
+
+	if err := o.ValidateFields(); err != nil {
+		return err
+	}
+
+	// Cross-flag — only checked after structural pass so we don't
+	// double-report a bad value.
+
+	// --mode=auto is reserved for M4-T03; refuse until that detector
+	// ships so we don't silently produce plans with an unresolved
+	// mode. (M4-T01+T02 review-pass — P1/P2.)
+	if o.Mode == ModeAuto {
+		return ErrModeAutoNotImplemented
+	}
+
+	// --addon fails closed until the addon engine slice ships — the
+	// flag is validated structurally above (registry + dedup) so a
+	// typo still gets the registry error first, but a *valid* addon
+	// must not silently no-op through apply. (E2E shakedown 2026-07-04.)
+	if len(o.Addons) > 0 {
+		return ErrAddonsNotImplemented
+	}
+
+	// Object-storage mode gates (OS-1/OS-2). Structural companions
+	// were validated above; here the mode itself is dispositioned:
+	//   unset      → required (typed; cobra adds the sibling hint)
+	//   external-* → permanent stub fail-closed (no fleet manifests)
+	//   rook-*     → allowed — the OS-2 scaffold writer wires the
+	//                overlay + Flux layer + platform dependsOn at apply
+	//   disabled   → allowed; the explicit mode IS the consent
+	//                (plan render carries the monitoring warning)
+	switch o.RookMode {
+	case "":
+		return ErrObjectStorageModeRequired
+	case RookExternalCeph, RookExternalS3:
+		return fmt.Errorf("%w (mode=%s)", ErrObjectStorageModeStub, o.RookMode)
+	}
+
+	// VM storage mode gates (PRD vm-storage-mode). shared-rbd* is an
+	// OPTIONAL VM tier; when chosen it needs an object-storage mode that
+	// ships the rbd-pool CephBlockPool (the rook-ceph-* modes) — verified
+	// here, never created (§2.2). shared-rbd-live-migration is
+	// installer-deferred (runtime egress + Block catalog §3.2b) — fail
+	// closed with the manual path.
+	if scaffoldsVMStorage(o.VMStorageMode) && !scaffoldsObjectStorage(o.RookMode) {
+		return fmt.Errorf("%w (--vm-storage-mode=%s needs a rook-ceph-* object-storage mode that provides rbd-pool; --object-storage-mode=%s does not)", ErrVMStorageNeedsRookRBDPool, o.VMStorageMode, o.RookMode)
+	}
+	if o.VMStorageMode == VMStorageSharedRBDLiveMigration {
+		return ErrVMStorageLiveMigrationDeferred
+	}
+
+	// --github-owner + --github-repo are required for ANY fleet
+	// mode that will eventually reach `flux-install.sh` — the
+	// script needs them to point Flux at the right remote.
+	// `--no-push` skips flux-install entirely (Flux can't
+	// reconcile from a non-pushed commit), so those paths
+	// tolerate missing owner/repo. Dry-run also enforces the
+	// requirement so a plan preview surfaces the operator's
+	// missing-arg mistake BEFORE they discover it at apply time.
+	//
+	// Reviewer M4-T05 P2 close (revisited): previously we only
+	// required these on `--fleet-mode=new-repo`, so an
+	// existing-fleet OR existing-repo + --provider=gitlab operator
+	// could omit them and `flux-install.sh` would silently default
+	// to `kube-dc/kube-dc-fleet` (a GitHub org — wrong remote
+	// entirely, wrong provider, wrong URL scheme).
+	//
+	// All three fleet modes reach `runFluxInstall` when --no-push
+	// is unset (see `Apply` — flux-install fires whenever the
+	// commit was pushed to a remote), so all three need owner/repo.
+	needsFluxInstall := o.FleetMode == FleetNewRepo ||
+		o.FleetMode == FleetExistingFleet ||
+		o.FleetMode == FleetExistingRepo
+	if needsFluxInstall && !o.NoPush {
+		missing := []string{}
+		if o.GitHubOwner == "" {
+			missing = append(missing, "--github-owner")
+		}
+		if o.GitHubRepo == "" {
+			missing = append(missing, "--github-repo")
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("%w (missing %s)", ErrFleetModeNewRepo, strings.Join(missing, " + "))
+		}
+	}
+
+	// --provider validation. Empty defaults to GitHub at the engine
+	// layer for backward compat; non-empty must be one of the known
+	// providers so a typo doesn't silently route to the wrong
+	// remote-repo host.
+	switch o.Provider {
+	case "", ProviderGitHub, ProviderGitLab:
+		// OK
+	default:
+		return fmt.Errorf("%w: got %q (want %q or %q)",
+			ErrUnknownProvider, string(o.Provider),
+			string(ProviderGitHub), string(ProviderGitLab))
+	}
+
+	// --fleet-mode=existing-fleet needs --repo so the engine knows
+	// where to look for sibling clusters / age recipients / version
+	// pins. Without it BuildPlan would silently render an empty
+	// "Prior clusters" list, a misleading footgun. (M4-T01+T02
+	// review-pass — P2/P3.)
+	if o.FleetMode == FleetExistingFleet && o.Repo == "" {
+		return ErrFleetModeExistingRepo
+	}
+
+	// --dry-run + --apply-plan are mutually exclusive — applying a
+	// plan IS the apply side; dry-run is the print side.
+	if o.DryRun && o.ApplyPlan != "" {
+		return fmt.Errorf("%w: --dry-run and --apply-plan are mutually exclusive", ErrValidation)
+	}
+
+	// --plan-file with --apply-plan is redundant (the plan path is the
+	// apply path). Catch this rather than silently dropping --plan-file.
+	if o.ApplyPlan != "" && o.PlanFile != "" && o.PlanFile != o.ApplyPlan {
+		return fmt.Errorf("%w: --plan-file conflicts with --apply-plan (use --apply-plan alone)", ErrValidation)
+	}
+
+	// CI apply gate (installer-agentic-implementation-plan §9.M4-T01).
+	// `--no-tty` without one of {--yes, --apply-plan, --dry-run} is
+	// refused. The third path — "successful --dry-run in the same
+	// session writes a consent cache" — is consumed at engine-time
+	// (M4-T02 owns the cache layout). For T01 the cobra-time check
+	// only enforces the explicit flag forms.
+	if o.NoTTY && !o.Yes && o.ApplyPlan == "" && !o.DryRun {
+		return ErrApplyGate
+	}
+
+	return nil
+}
+
+// ValidateFields checks values that can be checked without reading a live
+// cluster or resolving an installation mode. Setup compilation uses the same
+// field rules as the established init command.
+func (o *InitOptions) ValidateFields() error {
+	var errs []string
+
+	// Structural — every field's own contract.
+	errs = append(errs, validateName(o.Name)...)
+	errs = append(errs, validateDomain(o.Domain)...)
+	errs = append(errs, validateNodeIP(o.NodeExternalIP)...)
+	errs = append(errs, validateEmail(o.Email)...)
+	errs = append(errs, validatePreset(o.Preset)...)
+	errs = append(errs, validateMode(o.Mode)...)
+	errs = append(errs, validateFleetMode(o.FleetMode)...)
+	errs = append(errs, validateObjectStorage(o)...)
+	errs = append(errs, validateVMStorage(o)...)
+	errs = append(errs, validateGPU(o)...)
+	errs = append(errs, validateAddons(o.Addons)...)
+	errs = append(errs, validatePAYG(o)...)
+	errs = append(errs, validateNodeNICs(o.NodeNICs)...)
+	errs = append(errs, validateNodeSSHHosts(o.PrimaryNode, o.NodeSSHHosts)...)
+	errs = append(errs, validateNodeSSHHostKeys(o.NodeSSHHostKeys)...)
+	errs = append(errs, validateSets(o.Sets)...)
+	// Validate typed overrides before planning. VLAN values retain the
+	// established preset error contract, including ErrPresetInvalidValue.
+	for _, key := range SpecOrderedKeys(o.Sets) {
+		if key == "EXT_NET_VLAN_ID" || key == "EXT_PUBLIC_VLAN_ID" {
+			continue
+		}
+		if err := validateKnownSetting(key, o.Sets[key]); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	if err := ValidateTLSMode(o.TLSMode, o.TLSCert, o.TLSKey); err != nil {
+		errs = append(errs, err.Error())
+	}
+	if err := validateDNS01Flags(o); err != nil {
+		errs = append(errs, err.Error())
+	}
+	errs = append(errs, validateIngressNodes(o)...)
+
+	if len(errs) > 0 {
+		return fmt.Errorf("%w: %s", ErrValidation, strings.Join(errs, "; "))
+	}
+
+	return nil
+}
+
+// --- Structural validators (small, table-friendly, each returns []string
+// so multiple rules per option can compose) ---
+
+func validateName(name string) []string {
+	if name == "" {
+		return []string{"--name is required"}
+	}
+	if !ValidClusterName(name) {
+		return []string{fmt.Sprintf("--name %q must be lowercase letters/digits/dashes (optionally nested with /, e.g. eu/dc1)", name)}
+	}
+	return nil
+}
+
+func validateDomain(domain string) []string {
+	if domain == "" {
+		return []string{"--domain is required"}
+	}
+	if !domainRegex.MatchString(strings.ToLower(domain)) {
+		return []string{fmt.Sprintf("--domain %q must be a FQDN (e.g. atlantis.example.com)", domain)}
+	}
+	return nil
+}
+
+func validateNodeIP(ip string) []string {
+	if ip == "" {
+		return []string{"--node-external-ip is required"}
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return []string{fmt.Sprintf("--node-external-ip %q is not a valid IP address", ip)}
+	}
+	return nil
+}
+
+func validateEmail(email string) []string {
+	if email == "" {
+		return []string{"--email is required (used for cert-manager + LetsEncrypt registration)"}
+	}
+	if _, err := mail.ParseAddress(email); err != nil {
+		return []string{fmt.Sprintf("--email %q is not a valid address: %v", email, err)}
+	}
+	return nil
+}
+
+func validatePreset(p Preset) []string {
+	if p == "" {
+		return []string{fmt.Sprintf("--preset is required (one of %s)", joinPresets(AllPresets))}
+	}
+	for _, ok := range AllPresets {
+		if p == ok {
+			return nil
+		}
+	}
+	return []string{fmt.Sprintf("--preset %q not recognised (want one of %s)", p, joinPresets(AllPresets))}
+}
+
+func validateMode(m Mode) []string {
+	if m == "" {
+		// Empty is rejected: the operator must say what init is walking
+		// into. `auto` is an explicit opt-in that probes a REACHABLE cluster
+		// (it never guesses greenfield); on a fresh bastion pass install.
+		return []string{fmt.Sprintf("--mode is required (one of %s); pass install for a fresh cluster, or auto to probe a cluster your kubeconfig already reaches", joinModes(AllModes))}
+	}
+	for _, ok := range AllModes {
+		if m == ok {
+			return nil
+		}
+	}
+	return []string{fmt.Sprintf("--mode %q not recognised (want one of %s)", m, joinModes(AllModes))}
+}
+
+func validateFleetMode(f FleetMode) []string {
+	if f == "" {
+		return []string{fmt.Sprintf("--fleet-mode is required (one of %s)", joinFleetModes(AllFleetModes))}
+	}
+	for _, ok := range AllFleetModes {
+		if f == ok {
+			return nil
+		}
+	}
+	return []string{fmt.Sprintf("--fleet-mode %q not recognised (want one of %s)", f, joinFleetModes(AllFleetModes))}
+}
+
+// validateObjectStorage is the structural half of the OS-1 mode
+// contract: enum membership + per-mode companion flags (the
+// M4-T04 preset-required-keys pattern) + SEMANTIC value validation.
+// The REQUIRED check itself lives in Validate's cross-flag pass
+// (typed sentinel so the cobra layer can attach the sibling-mode
+// hint), so empty mode is skipped here.
+//
+// Semantic validation matters because every companion value lands
+// verbatim as a `KEY=value` line in cluster-config.env (OS-2 writer +
+// config.Env.Set store raw, unquoted values — reviewer P2 2026-07-04):
+// a newline would inject extra env keys, and an invalid node/device/
+// storage-class/hostname string would commit cleanly and only fail
+// minutes later inside Flux/Rook with a much worse error. The regexes
+// are anchored whole-string with restricted character classes, so
+// control chars, whitespace, `=`, and `$` (Flux postBuild substitution
+// trigger) are all structurally impossible in accepted values.
+func validateObjectStorage(o *InitOptions) []string {
+	if o.RookMode == "" {
+		return nil // cross-flag pass returns ErrObjectStorageModeRequired
+	}
+	known := false
+	for _, ok := range AllRookModes {
+		if o.RookMode == ok {
+			known = true
+			break
+		}
+	}
+	if !known {
+		return []string{fmt.Sprintf("--object-storage-mode %q not recognised (want one of %s)", o.RookMode, joinRookModes(AllRookModes))}
+	}
+
+	var errs []string
+
+	// Shared: S3 hostname (→ S3_HOSTNAME) must be a bare FQDN, same
+	// contract as --domain. Empty = default s3.<domain> (validated
+	// via --domain already).
+	if o.S3Hostname != "" && !domainRegex.MatchString(o.S3Hostname) {
+		errs = append(errs, fmt.Sprintf("--s3-hostname %q is not a valid FQDN (bare hostname, e.g. s3.example.com — no scheme, no path)", o.S3Hostname))
+	}
+
+	switch o.RookMode {
+	case RookCephLocal:
+		// → CEPH_LOCAL_OSD_NODE + CEPH_LOCAL_OSD_SIZE_GB (device
+		// defaults to loop0 fleet-side).
+		switch {
+		case o.RookOSDNode == "":
+			errs = append(errs, "--object-storage-mode=rook-ceph-local requires --rook-osd-node")
+		case !k8sNodeNameRegex.MatchString(o.RookOSDNode):
+			errs = append(errs, fmt.Sprintf("--rook-osd-node %q is not a valid Kubernetes node name (lowercase RFC 1123: a-z, 0-9, '-', '.')", o.RookOSDNode))
+		}
+		if o.RookOSDSizeGB < 0 || ((o.RookOSDDevice == "" || loopDeviceRegex.MatchString(strings.TrimPrefix(o.RookOSDDevice, "/dev/"))) && o.RookOSDSizeGB == 0) {
+			errs = append(errs, "--rook-osd-size-gb must not be negative; loop-backed storage requires a value > 0")
+		}
+		// Canonicalize the obvious operator spelling: lsblk shows bare
+		// names but muscle memory types /dev/… (field report 2026-07-23
+		// — three rejected devices on a live install). Strip the prefix
+		// instead of rejecting it; the writer then emits the bare name
+		// the fleet template expects.
+		o.RookOSDDevice = strings.TrimPrefix(o.RookOSDDevice, "/dev/")
+		if o.RookOSDDevice != "" && !deviceNameRegex.MatchString(o.RookOSDDevice) {
+			errs = append(errs, fmt.Sprintf("--rook-osd-device %q is not a valid device name (e.g. sdb, nvme0n1, loop0)", o.RookOSDDevice))
+		}
+
+	case RookCephMultiNode:
+		if len(o.CephNodes) < 1 || len(o.CephNodes) > 3 {
+			errs = append(errs, fmt.Sprintf("--object-storage-mode=rook-ceph-multi-node requires 1 to 3 --ceph-node NODE=DEVICE entries (got %d)", len(o.CephNodes)))
+		}
+		replicas, err := objectStorageReplication(o.RookMode, len(o.CephNodes), o.Sets["CEPH_REPLICATION_SIZE"])
+		if err != nil {
+			errs = append(errs, err.Error())
+		} else if len(o.CephNodes) > 0 && replicas > len(o.CephNodes) {
+			errs = append(errs, "CEPH_REPLICATION_SIZE cannot exceed the number of selected storage servers")
+		}
+		// Canonicalize /dev/-prefixed devices (same rationale as
+		// --rook-osd-device above) before validation + the scaffold
+		// writer consume the map.
+		for n, d := range o.CephNodes {
+			o.CephNodes[n] = strings.TrimPrefix(d, "/dev/")
+		}
+		// Deterministic error order: sorted node names.
+		nodes := make([]string, 0, len(o.CephNodes))
+		for n := range o.CephNodes {
+			nodes = append(nodes, n)
+		}
+		sort.Strings(nodes)
+		for _, node := range nodes {
+			dev := o.CephNodes[node]
+			if !k8sNodeNameRegex.MatchString(node) {
+				errs = append(errs, fmt.Sprintf("--ceph-node node %q is not a valid Kubernetes node name (lowercase RFC 1123: a-z, 0-9, '-', '.')", node))
+			}
+			if !deviceNameRegex.MatchString(dev) || loopDeviceRegex.MatchString(dev) {
+				errs = append(errs, fmt.Sprintf("--ceph-node device %q (node %s) is not a valid device name (e.g. sdb, nvme0n1)", dev, node))
+			}
+		}
+	case RookCephPVC:
+		// → CEPH_OSD_STORAGE_CLASS (count/size have fleet defaults).
+		switch {
+		case o.CephStorageClass == "":
+			errs = append(errs, "--object-storage-mode=rook-ceph-pvc requires --ceph-storage-class")
+		case !k8sNodeNameRegex.MatchString(o.CephStorageClass):
+			// StorageClass names share the RFC 1123 subdomain shape.
+			errs = append(errs, fmt.Sprintf("--ceph-storage-class %q is not a valid StorageClass name (lowercase RFC 1123: a-z, 0-9, '-', '.')", o.CephStorageClass))
+		}
+		if o.CephOSDCount < 0 {
+			errs = append(errs, "--ceph-osd-count must be >= 0 (0 = fleet default)")
+		}
+		if o.CephOSDVolumeSizeGB < 0 {
+			errs = append(errs, "--ceph-osd-volume-size-gb must be >= 0 (0 = fleet default)")
+		}
+	}
+	return errs
+}
+
+// validateVMStorage does the structural checks for --vm-storage-mode and
+// its golden flags (cobra-time; no fleet access — the golden-catalog
+// existence check is at write time, resolveVMGoldens). The rbd-pool
+// cross-flag requirement + the live-migration deferral are in Validate's
+// cross-flag pass. Empty mode is valid (optional; == local).
+func validateVMStorage(o *InitOptions) []string {
+	var errs []string
+	if o.VMStorageMode != "" {
+		known := false
+		for _, ok := range AllVMStorageModes {
+			if o.VMStorageMode == ok {
+				known = true
+				break
+			}
+		}
+		if !known {
+			// Bad mode — return early, don't cascade golden-flag noise.
+			return []string{fmt.Sprintf("--vm-storage-mode %q not recognised (want one of %s)", o.VMStorageMode, joinVMStorageModes(AllVMStorageModes))}
+		}
+	}
+	for _, g := range o.VMGoldens {
+		if !vmGoldenNameRegex.MatchString(g) {
+			errs = append(errs, fmt.Sprintf("--vm-golden %q is not a valid golden name (lowercase a-z, 0-9, '-', '.')", g))
+		}
+	}
+	for _, g := range o.VMGoldensBlock {
+		if !vmGoldenNameRegex.MatchString(g) {
+			errs = append(errs, fmt.Sprintf("--vm-golden-block %q is not a valid golden name (lowercase a-z, 0-9, '-', '.')", g))
+		}
+	}
+	// The golden flags only make sense with a shared-rbd mode.
+	if len(o.VMGoldens) > 0 && !scaffoldsVMStorage(o.VMStorageMode) {
+		errs = append(errs, "--vm-golden requires --vm-storage-mode=shared-rbd (or shared-rbd-live-migration)")
+	}
+	if len(o.VMGoldensBlock) > 0 && o.VMStorageMode != VMStorageSharedRBDLiveMigration {
+		errs = append(errs, "--vm-golden-block requires --vm-storage-mode=shared-rbd-live-migration")
+	}
+	return errs
+}
+
+// k8sNodeNameRegex is the RFC 1123 subdomain shape Kubernetes uses
+// for node + StorageClass (and most object) names: lowercase
+// alphanumerics, '-', '.', must start/end alphanumeric. Anchored
+// whole-string, so newlines / '=' / '$' / spaces are structurally
+// excluded — these values land verbatim in cluster-config.env.
+var k8sNodeNameRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$`)
+
+// deviceNameRegex accepts Linux block-device identifiers as Rook
+// consumes them: short names (sdb, nvme0n1, loop0) and by-path/by-id
+// style relative paths. Same env-safety anchoring as above.
+var deviceNameRegex = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9/_.-]*$`)
+
+// allowedAddons is the v1 addon registry. Adding an addon means
+// adding both the validator entry here and the rendering hook in M4
+// engine slices.
+var allowedAddons = map[string]bool{
+	"metallb":        true,
+	"sso-google":     true,
+	"stripe-billing": true,
+	"velero":         true,
+}
+
+func validateAddons(addons []string) []string {
+	var errs []string
+	seen := map[string]bool{}
+	for _, a := range addons {
+		if !allowedAddons[a] {
+			errs = append(errs, fmt.Sprintf("--addon %q not in registry (allowed: metallb, sso-google, stripe-billing, velero)", a))
+			continue
+		}
+		if seen[a] {
+			errs = append(errs, fmt.Sprintf("--addon %q specified more than once", a))
+			continue
+		}
+		seen[a] = true
+	}
+	return errs
+}
+
+// validateIngressNodes checks the front-door node selection (design v2
+// §5a). Duplicates and blanks are operator typos worth catching before a
+// scaffold; the address-layer value is re-checked here so `--ingress-node`
+// users get the error even on a code path that skips the env validator.
+//
+// One ingress node is ALLOWED but weak: with a no-VIP layer each node
+// address is a DNS A record, so one node is a single point of failure;
+// with a VIP layer MetalLB can only move the VIP to another node holding a
+// ready local endpoint (§5a A1), so one node means no failover either. The
+// plan surfaces that; it is not an error, because small pilots legitimately
+// start with one.
+func validateIngressNodes(o *InitOptions) []string {
+	var errs []string
+	seen := map[string]bool{}
+	for _, n := range o.IngressNodes {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			errs = append(errs, "--ingress-node: empty node name")
+			continue
+		}
+		if seen[n] {
+			errs = append(errs, fmt.Sprintf("--ingress-node: %q listed twice", n))
+		}
+		seen[n] = true
+	}
+	if o.IngressAddressLayer != "" {
+		switch o.IngressAddressLayer {
+		case AddressLayerNone, AddressLayerMetalLBL2, AddressLayerMetalLBBGP:
+		default:
+			errs = append(errs, fmt.Sprintf(
+				"--ingress-address-layer %q is not valid (%s)",
+				o.IngressAddressLayer, strings.Join(AllAddressLayers, " | ")))
+		}
+	}
+	return errs
+}
+
+func validateNodeNICs(nics map[string]string) []string {
+	var errs []string
+	// Sort keys for deterministic error ordering — Go map iteration is
+	// randomized and we want test failures to be reproducible.
+	keys := make([]string, 0, len(nics))
+	for k := range nics {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, node := range keys {
+		iface := nics[node]
+		if node == "" {
+			errs = append(errs, "--node-nic key (node name) cannot be empty")
+			continue
+		}
+		if iface == "" {
+			errs = append(errs, fmt.Sprintf("--node-nic %s= has empty iface", node))
+			continue
+		}
+		// Reuse the canonical NIC-name validator (M4-T11 review-pass
+		// — P2): catches shell metacharacters, whitespace, and
+		// Linux IFNAMSIZ > 15 chars. Without this, `--node-nic
+		// SRV5=enp1s0;rm` would land in the ProviderNetwork patch.
+		if msg := validateNICName(iface); msg != "" {
+			errs = append(errs, fmt.Sprintf("--node-nic %s=%s: %s", node, iface, msg))
+		}
+	}
+	return errs
+}
+
+func validateSets(sets map[string]string) []string {
+	var errs []string
+	keys := make([]string, 0, len(sets))
+	for k := range sets {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		switch k {
+		case "INSTALLATION_KIND", "SERVICES_INSTALLATION", "SERVICES_CELL_ID", "SERVICES_DATAPLANE_NAME", "SERVICES_DATAPLANE_UID", "SERVICES_RUNNER_SELF", "SERVICES_FAMILIES", "SERVICES_UNMANAGED_OPERATORS", "SERVICES_STORAGE_ROLES", "SERVICES_STORAGE_BUDGETS", "SERVICES_PG_STORAGE_CLASSES", "SERVICES_EGRESS_PROBE_URLS", "SERVICES_OPENBAO_ADDRESS", "SERVICES_RECOVERY_PUBLIC_URL", "SERVICES_RECOVERY_GATEWAY_ENABLED", "SERVICES_RECOVERY_GATEWAY_PARENT", "SERVICES_RECOVERY_GATEWAY_PARENT_NAMESPACE", "SERVICES_RECOVERY_GATEWAY_SECTION", "KUBE_DC_UI_MANAGED_SERVICES_ALL_ORGANIZATIONS", "KUBE_DC_MANAGER_REPLICAS", "KUBE_DC_MANAGER_SINGLE_REPLICA_ACCEPTED":
+			errs = append(errs, fmt.Sprintf("--set %s is generated by the installer; use --installation-kind and --managed-services", k))
+			continue
+		}
+		if k == "" {
+			errs = append(errs, "--set key cannot be empty")
+			continue
+		}
+		// Disallow lowercase-leading keys — cluster-config.env keys
+		// are SCREAMING_SNAKE_CASE by convention; a lowercase key
+		// (e.g. `--set domain=...`) is almost certainly a typo for
+		// the flag form (`--domain ...`).
+		if !isUpperKey(k) {
+			errs = append(errs, fmt.Sprintf("--set key %q must be SCREAMING_SNAKE_CASE (cluster-config.env convention); did you mean a dedicated flag?", k))
+		}
+	}
+	return errs
+}
+
+func isUpperKey(k string) bool {
+	if k == "" {
+		return false
+	}
+	for _, r := range k {
+		switch {
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '_':
+		default:
+			return false
+		}
+	}
+	// First char must be a letter.
+	return k[0] >= 'A' && k[0] <= 'Z'
+}
+
+// --- Help-string joiners (stable order for cobra Long help) ---
+
+func joinPresets(p []Preset) string {
+	out := make([]string, len(p))
+	for i, v := range p {
+		out[i] = string(v)
+	}
+	return strings.Join(out, "|")
+}
+
+func joinModes(m []Mode) string {
+	out := make([]string, len(m))
+	for i, v := range m {
+		out[i] = string(v)
+	}
+	return strings.Join(out, "|")
+}
+
+func joinFleetModes(f []FleetMode) string {
+	out := make([]string, len(f))
+	for i, v := range f {
+		out[i] = string(v)
+	}
+	return strings.Join(out, "|")
+}
+
+func joinRookModes(r []RookMode) string {
+	out := make([]string, len(r))
+	for i, v := range r {
+		out[i] = string(v)
+	}
+	return strings.Join(out, "|")
+}
+
+// ParseSetPairs converts a slice of `KEY=VALUE` strings (as cobra
+// returns for repeatable --set / --node-nic flags) into a map. Returns
+// an error on the first malformed entry — we surface this from cobra
+// flag-set rather than letting it land in Validate as a generic
+// "empty key" message.
+func ParseSetPairs(pairs []string) (map[string]string, error) {
+	out := make(map[string]string, len(pairs))
+	for _, raw := range pairs {
+		k, v, ok := strings.Cut(raw, "=")
+		if !ok {
+			return nil, fmt.Errorf("expected KEY=VALUE, got %q", raw)
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		if k == "" {
+			return nil, fmt.Errorf("empty key in %q", raw)
+		}
+		if _, exists := out[k]; exists {
+			return nil, fmt.Errorf("duplicate key %q", k)
+		}
+		out[k] = v
+	}
+	return out, nil
+}

@@ -1,0 +1,219 @@
+{{- if .Values.k8Manager.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kube-dc.k8manager.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-dc.k8manager.labels" . | nindent 4 }}
+    control-plane: kube-dc-k8-manager
+spec:
+  replicas: {{ .Values.k8Manager.replicaCount | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "kube-dc.k8manager.selectorLabels" . | nindent 6 }}
+      control-plane: kube-dc-k8-manager
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        {{- include "kube-dc.k8manager.selectorLabels" . | nindent 8 }}
+        {{- include "kube-dc.podVersionLabel" . | nindent 8 }}
+        control-plane: kube-dc-k8-manager
+    spec:
+      serviceAccountName: {{ include "kube-dc.k8manager.fullname" . }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 10
+      {{- with .Values.k8Manager.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.k8Manager.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.k8Manager.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: manager
+        image: "{{ .Values.k8Manager.image.repository }}:{{ .Values.k8Manager.image.tag }}{{ with .Values.k8Manager.image.digest }}@{{ . }}{{ end }}"
+        imagePullPolicy: {{ .Values.k8Manager.image.pullPolicy | default "IfNotPresent" }}
+        command:
+        - /manager
+        args:
+        - --leader-elect
+        - --health-probe-bind-address=:8081
+        {{- if or .Values.k8Manager.metrics.enabled .Values.k8Manager.metricsEnabled }}
+        - --metrics-bind-address=:8443
+        - --metrics-secure=true
+        {{- else }}
+        - --metrics-bind-address=0
+        {{- end }}
+        {{- with .Values.k8Manager.extraArgs }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        env:
+        {{- if .Values.k8Manager.etcdDefaultStorageClass }}
+        # Operator default for NEW tenant-etcd datastores that don't pin
+        # spec.etcd.storage.storageClassName. Existing StatefulSets are
+        # never retro-rolled.
+        - name: ETCD_DEFAULT_STORAGE_CLASS
+          value: {{ .Values.k8Manager.etcdDefaultStorageClass | quote }}
+        {{- end }}
+        # Project-internal LoadBalancer VIPs: off | observe | enable.
+        - name: LB_BLOCK_MODE
+          value: {{ (.Values.k8Manager.lbBlockMode | default "observe") | quote }}
+        {{- if .Values.k8Manager.lbBlockRequireOptIn }}
+        # Advanced: require an explicit per-cluster opt-in annotation
+        # (network.kube-dc.com/lb-block=enabled) instead of participating by default.
+        - name: LB_BLOCK_REQUIRE_OPT_IN
+          value: "true"
+        {{- end }}
+        - name: INFRA_API_ENDPOINT
+          value: {{ include "kube-dc.managementAPIEndpoint" (list $ .Values.k8Manager.infraAPIEndpoint) | quote }}
+        - name: KAMAJI_DATASTORE_NAME
+          value: {{ .Values.k8Manager.kamajiDatastoreName | default "default" | quote }}
+        - name: KAMAJI_DATASTORE_NAMESPACE
+          value: {{ .Values.k8Manager.kamajiDatastoreNamespace | default "kamaji-system" | quote }}
+        # M5-T04 managed-K8s etcd encryption-at-rest. Both vars are
+        # optional — when empty the encryption reconciler returns a
+        # clear error refusing to provision the sidecar. See
+        # docs/internal/managed-k8s-encryption-runbook.md.
+        {{- if .Values.k8Manager.kmsPluginImage }}
+        - name: KMS_PLUGIN_IMAGE
+          value: {{ .Values.k8Manager.kmsPluginImage | quote }}
+        {{- end }}
+        {{- if .Values.k8Manager.openBaoUrl }}
+        - name: OPENBAO_URL
+          value: {{ .Values.k8Manager.openBaoUrl | quote }}
+        {{- end }}
+        # Cluster-wide S3 endpoint, used by KdcCluster etcd-backup CronJobs
+        # as a fallback when KdcCluster.spec.backup.s3Endpoint is not set
+        # AND the per-Project OBC ConfigMap doesn't expose a routable host.
+        # Same pattern as db-manager and kube-dc-backend.
+        {{- if .Values.s3Endpoint }}
+        - name: S3_ENDPOINT
+          value: "{{ .Values.s3Endpoint }}"
+        {{- end }}
+        {{- if .Values.k8Manager.mgmtAutoscaling.enabled }}
+        # Management-worker autoscaling: adapter + provisioner + token broker
+        # + acceptance gate (SetupMgmtAutoscaling). Fail-closed at every
+        # layer on missing material.
+        - name: MGMT_AUTOSCALER_ADAPTER_ENABLED
+          value: "true"
+        - name: MGMT_CLUSTER_ID
+          value: {{ required "k8Manager.mgmtAutoscaling.clusterID is required" .Values.k8Manager.mgmtAutoscaling.clusterID | quote }}
+        - name: MGMT_ADAPTER_TLS_CERT
+          value: /etc/mgmt-adapter-tls/tls.crt
+        - name: MGMT_ADAPTER_TLS_KEY
+          value: /etc/mgmt-adapter-tls/tls.key
+        - name: MGMT_ADAPTER_CLIENT_CA
+          value: /etc/mgmt-adapter-tls/ca.crt
+        - name: MGMT_ADAPTER_CLIENT_CN
+          value: mgmt-cluster-autoscaler
+        - name: MGMT_PROVIDER_REGION
+          value: {{ required "k8Manager.mgmtAutoscaling.provider.region is required" .Values.k8Manager.mgmtAutoscaling.provider.region | quote }}
+        - name: MGMT_PROVIDER_USER
+          valueFrom:
+            secretKeyRef:
+              name: {{ required "k8Manager.mgmtAutoscaling.provider.secretName is required" .Values.k8Manager.mgmtAutoscaling.provider.secretName }}
+              key: username
+              # optional: a missing/typo'd provider secret must degrade to the
+              # feature's own DEPENDENCY-OUTAGE path (condition + paging
+              # alert), not CreateContainerConfigError the entire k8-manager
+              # pod and stop unrelated reconciliation (review finding).
+              optional: true
+        - name: MGMT_PROVIDER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.k8Manager.mgmtAutoscaling.provider.secretName }}
+              key: password
+              optional: true
+        # Impersonation OAuth (for providers where no basic-auth credential exists).
+        # All four optional: presence of the full quartet in the provider
+        # secret flips the k8-manager client to the service-account flow;
+        # partial config is a hard error in Go (never a silent basic fallback).
+        - name: MGMT_PROVIDER_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.k8Manager.mgmtAutoscaling.provider.secretName }}
+              key: client_id
+              optional: true
+        - name: MGMT_PROVIDER_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.k8Manager.mgmtAutoscaling.provider.secretName }}
+              key: client_secret
+              optional: true
+        - name: MGMT_PROVIDER_OAUTH_URL
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.k8Manager.mgmtAutoscaling.provider.secretName }}
+              key: oauth_url
+              optional: true
+        - name: MGMT_PROVIDER_USER_EMAIL
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.k8Manager.mgmtAutoscaling.provider.secretName }}
+              key: user_email
+              optional: true
+        - name: MGMT_PROVIDER_MHZ_PER_CORE
+          value: {{ .Values.k8Manager.mgmtAutoscaling.provider.mhzPerCore | quote }}
+        {{- if .Values.k8Manager.mgmtAutoscaling.tokenGroups }}
+        - name: MGMT_TOKEN_GROUPS
+          value: {{ .Values.k8Manager.mgmtAutoscaling.tokenGroups | quote }}
+        {{- end }}
+        {{- end }}
+        {{- with .Values.k8Manager.extraEnv }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        ports:
+        - containerPort: 8081
+          name: health
+          protocol: TCP
+        {{- if or .Values.k8Manager.metrics.enabled .Values.k8Manager.metricsEnabled }}
+        - containerPort: 8443
+          name: metrics
+          protocol: TCP
+        {{- end }}
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          {{- toYaml .Values.k8Manager.resources | nindent 10 }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        {{- if .Values.k8Manager.mgmtAutoscaling.enabled }}
+        volumeMounts:
+          - name: mgmt-adapter-tls
+            mountPath: /etc/mgmt-adapter-tls
+            readOnly: true
+        {{- end }}
+      {{- if .Values.k8Manager.mgmtAutoscaling.enabled }}
+      volumes:
+        # Serving keypair + the dedicated client CA. ca.crt in this Secret is
+        # the mgmt-autoscaler-ca that signs the CA client cert — exactly the
+        # bundle the adapter must trust, nothing broader.
+        - name: mgmt-adapter-tls
+          secret:
+            secretName: mgmt-adapter-server-tls
+      {{- end }}
+{{- end }}

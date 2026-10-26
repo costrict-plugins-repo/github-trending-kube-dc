@@ -1,0 +1,133 @@
+{{- if .Values.dbManager.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kube-dc.dbmanager.fullname" . }}
+  labels:
+    {{- include "kube-dc.dbmanager.labels" . | nindent 4 }}
+rules:
+- apiGroups: [""]
+  resources: [configmaps]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [events]
+  verbs: [create, patch]
+# M4-T01: db-manager resolves a KdcDatabase's owning Org by reading
+# the project namespace's `hnc.x-k8s.io/subnamespace-of` annotation.
+# Needs list+watch (not just get) because controller-runtime's cached
+# client always sets up an informer per Kind it reads — a get-only
+# binding produces a "Failed to watch *v1.Namespace: forbidden" log
+# spam loop. Permissions are still narrow: read-only against namespace
+# metadata, no edits.
+- apiGroups: [""]
+  resources: [namespaces]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, list, patch, watch]
+# The dual-home gate (db-manager >= v0.1.12) follows the mgmt Service's
+# Endpoints to the backing pod, to prove it actually carries the infra NIC
+# before dropping the `-ext` management endpoint from OpenBao's stored
+# ConnectionURL. Same reasoning as the namespaces rule above: list+watch, not
+# get, or controller-runtime's informer logs "Failed to watch *v1.Endpoints:
+# forbidden" in a loop and the cache never syncs — which is exactly what
+# happened on a live cluster 2026-07-19 when the code shipped without this.
+- apiGroups: [""]
+  resources: [endpoints]
+  verbs: [get, list, watch]
+# PVC delete is required by the in-place restore flow: db-manager removes
+# the engine cluster's PVCs after deleting the engine CR so the new
+# Cluster/MariaDB bootstraps onto fresh volumes (CNPG/mariadb-operator
+# both refuse to reuse PVCs for a recovery bootstrap).
+- apiGroups: [""]
+  resources: [persistentvolumeclaims]
+  verbs: [delete, get, list, watch]
+- apiGroups: [""]
+  resources: [secrets]
+  verbs: [create, get, list, update, watch]
+- apiGroups: [""]
+  resources: [services]
+  verbs: [create, delete, get, list, patch, update, watch]
+- apiGroups: [batch]
+  resources: [jobs]
+  verbs: [create, delete, get, list, watch]
+# M3-T05 FU1: db-manager renders per-database post-process CronJobs
+# that run an operator-supplied wrapper image to encrypt backups
+# at rest. Owned by the KdcDatabase; CRUD here so the controller
+# can render + reconcile + clean up.
+- apiGroups: [batch]
+  resources: [cronjobs]
+  verbs: [create, delete, get, list, patch, update, watch]
+- apiGroups: [db.kube-dc.com]
+  resources: [kdcdatabases]
+  verbs: [create, delete, get, list, patch, update, watch]
+- apiGroups: [db.kube-dc.com]
+  resources: [kdcdatabases/finalizers]
+  verbs: [update]
+- apiGroups: [db.kube-dc.com]
+  resources: [kdcdatabases/status]
+  verbs: [get, patch, update]
+- apiGroups: [gateway.envoyproxy.io]
+  resources: [backends]
+  verbs: [create, delete, get, list, patch, update, watch]
+- apiGroups: [gateway.networking.k8s.io]
+  resources: [tlsroutes]
+  verbs: [create, delete, get, list, patch, update, watch]
+- apiGroups: [k8s.mariadb.com]
+  resources: [mariadbs, physicalbackups]
+  verbs: [create, delete, get, list, patch, update, watch]
+- apiGroups: [k8s.mariadb.com]
+  resources: [mariadbs/status]
+  verbs: [get]
+# `backups` (logical) is read by the UI snapshot listing path and is
+# reserved for a future logical-restore mode. CRUD here lets the
+# operator manage it later without another RBAC bump.
+- apiGroups: [k8s.mariadb.com]
+  resources: [backups]
+  verbs: [create, delete, get, list, watch]
+# db-manager >= v0.5.24 checks for Restores aimed at a MariaDB before it
+# reconciles the cluster; without this every MariaDB KdcDatabase fails with
+# "restores.k8s.mariadb.com is forbidden" (measured on stage 2026-09-06).
+- apiGroups: [k8s.mariadb.com]
+  resources: [restores]
+  verbs: [get, list, watch]
+# ... and, in the same preflight, for SqlJobs, Users, Grants, Databases,
+# Connections and MaxScales aimed at the engine's name (engine_mariadb.go:
+# a mariadb-operator resource can be created before its MariaDB exists and
+# would run against the platform's engine the moment it appears). The
+# restores rule above fixed only the first refusal of that loop; the next
+# one, "sqljobs.k8s.mariadb.com is forbidden", failed every MariaDB
+# KdcDatabase on stage (2026-09-07). Read only.
+- apiGroups: [k8s.mariadb.com]
+  resources: [sqljobs, users, grants, databases, connections, maxscales]
+  verbs: [get, list, watch]
+- apiGroups: [kube-dc.com]
+  resources: [eips]
+  verbs: [create, delete, get, list, patch, update, watch]
+- apiGroups: [kube-dc.com]
+  resources: [projects]
+  verbs: [get, list, watch]
+- apiGroups: [objectbucket.io]
+  resources: [objectbucketclaims]
+  verbs: [create, delete, get, list, watch]
+- apiGroups: [postgresql.cnpg.io]
+  resources: [clusters, scheduledbackups]
+  verbs: [create, delete, get, list, patch, update, watch]
+- apiGroups: [postgresql.cnpg.io]
+  resources: [clusters/status]
+  verbs: [get]
+# `backups` (the cnpg.io/Backup CR) is the source-of-truth for restore:
+# `bootstrap.recovery.backup.name` references it. The operator must be
+# able to create on-demand Backup CRs (UI "snapshot now") and delete
+# stale ones during teardown.
+- apiGroups: [postgresql.cnpg.io]
+  resources: [backups]
+  verbs: [create, delete, get, list, watch]
+# M3-T05 envelope encryption: db-manager reads the kube-dc KMSKey CR
+# (security.kube-dc.com/v1alpha1) to pull status.keyId for the
+# OpenBao Transit wrap path. Read-only; the KMSKey lifecycle stays
+# on the kube-dc-manager side.
+- apiGroups: [security.kube-dc.com]
+  resources: [kmskeys]
+  verbs: [get, list, watch]
+{{- end }}

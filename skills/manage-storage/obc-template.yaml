@@ -1,0 +1,11 @@
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: "{bucket-name}"
+  namespace: "{backing-namespace}"
+  labels:
+    # Required for Kube-DC dashboard attribution and Organization usage totals.
+    kube-dc.com/organization: "{organization}"
+spec:
+  bucketName: "{backing-namespace}-{bucket-name}"
+  storageClassName: "{bucket-storage-class}"

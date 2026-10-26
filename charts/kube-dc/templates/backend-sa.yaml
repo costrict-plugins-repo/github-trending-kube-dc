@@ -1,0 +1,337 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "kube-dc.backend.serviceAccountName" . }}
+  labels:
+    {{- include "kube-dc.backend.labels" . | nindent 4 }}
+  {{- with .Values.backend.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: {{ .Values.backend.serviceAccount.automount }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name:  {{ include "kube-dc.backend.serviceAccountName" . }}
+  labels:
+    {{- include "kube-dc.backend.labels" . | nindent 4 }}
+  {{- with .Values.backend.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+rules:
+  {{- if .Values.platformApi.enabled }}
+  # The platform internal listener verifies the extension API server's token.
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  # Superadmin Provisioning API page (controllers/admin/provisioningApi.js):
+  # machine clients are RBAC bindings. Kubernetes lets an identity bind only
+  # the roles it may `bind` (or whose permissions it holds), so `bind` is
+  # limited to the provisioning roles; `use` on organizationprefixes lets it
+  # create and bind the per-prefix roles.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterrolebindings", "clusterroles"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    resourceNames: ["kube-dc:provisioner", "kube-dc:platform:users", "kube-dc:platform:console-login", "kube-dc:platform:usage-reader"]
+    verbs: ["bind"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles"]
+    resourceNames: ["kube-dc:platform:plan-reader"]
+    verbs: ["bind"]
+  - apiGroups: ["kube-dc.com"]
+    resources: ["organizationprefixes"]
+    verbs: ["use"]
+  - apiGroups: ["apiregistration.k8s.io"]
+    resources: ["apiservices"]
+    resourceNames: ["v1alpha1.platform.kube-dc.com"]
+    verbs: ["get"]
+  {{- end }}
+  # Catalog and provider authority resolution use the backend identity.
+  # Instance, operation and binding requests first authorize the Project caller;
+  # credential operations always use that caller's OpenBao token.
+  - apiGroups: ["services.kube-dc.com"]
+    resources: ["managedserviceclasses", "managedserviceplans", "connectivityclasses"]
+    verbs: ["get", "list"]
+  # Provider publication references contain no values. Caller ManagedSecret
+  # and OpenBao authorization remain mandatory for reveal.
+  - apiGroups: ["services.kube-dc.com"]
+    resources: ["credentialpublications"]
+    verbs: ["get"]
+  # Value-free database journals and the exact native placement authority.
+  - apiGroups: ["security.kube-dc.com"]
+    resources: ["servicedatabaseconnections", "servicedatabaseroles"]
+    verbs: ["get"]
+  # Lease revocation finds a binding's role journal when the binding has
+  # withdrawn its reference (provider not Ready, e.g. a closed gate).
+  - apiGroups: ["security.kube-dc.com"]
+    resources: ["servicedatabaseroles"]
+    verbs: ["list"]
+  - apiGroups: ["services.kube-dc.com"]
+    resources: ["serviceplacements", "servicedeployments", "servicedataplanes"]
+    verbs: ["get"]
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["clusters"]
+    verbs: ["get"]
+  # The operator views under /api/admin/managed-services are cluster-wide by
+  # nature (every Project's instances, every data plane, the operations parked
+  # for a provider), so they read with this identity behind the master-realm
+  # admin gate. Reads only: the tenant API still authorizes each Project caller
+  # and acts with the caller's own token.
+  - apiGroups: ["services.kube-dc.com"]
+    resources: ["managedservices", "servicedataplanes", "serviceplacements", "cellreservations", "servicebackups"]
+    verbs: ["get", "list"]
+  # serviceoperations also carry patch: approving a gated operation and
+  # withdrawing a queued one are annotation writes on this object. The cluster
+  # still decides -- the approval annotation is gated by an admission policy
+  # that admits only operator groups, and this identity is in none of them
+  # unless an installation deliberately grants it.
+  - apiGroups: ["services.kube-dc.com"]
+    resources: ["serviceoperations"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  # cronjobs (get/list): the admin OS-Images view reads the cdi-os-mirror-refresh
+  # CronJob for the mirror schedule / last-run.
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["get", "list"]
+  # volumesnapshots (get/list): the admin OS-Images view lists golden images
+  # cluster-wide (golden-images + golden-images-block) with the backend SA.
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["*"]
+    verbs: ["get", "list"]
+  # The org-admin quota API verifies the caller and Project ownership with the
+  # caller's JWT, then uses this identity for the controller-owned write. Direct
+  # tenant Kubernetes access to ResourceQuota remains read-only.
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims", "persistentvolumes", "services", "secrets", "serviceaccounts", "configmaps"]
+    verbs: ["*"]
+  # Admin Workloads page force-deletes pods (controllers/admin/organizationController.js deletePod)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["*"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["*"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list"]
+  - apiGroups: ["k8s.cni.cncf.io"]
+    resources: ["network-attachment-definitions"]
+    verbs: ["get", "list"]
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines", "virtualmachineinstances"]
+    verbs: ["*"]
+  - apiGroups: ["kubevirt.io"]
+    resources: ["kubevirts"]
+    verbs: ["get", "list"]
+  - apiGroups: ["subresources.kubevirt.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: ["instancetype.kubevirt.io"]
+    resources: ["*"]
+    verbs: ["*"] 
+  - apiGroups: ["cdi.kubevirt.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: ["pool.kubevirt.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["priorityclasses"]
+    verbs: ["get", "list"]
+  # Tenant-safe GPU capability discovery aggregates stable-v1 DRA inventory
+  # and allocations once, then caches only redacted per-profile totals.
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceslices", "deviceclasses"]
+    verbs: ["get", "list"]
+  # DRA tenant workloads are written only through the authenticated backend
+  # API. The controller creates fixed ResourceClaimTemplates; Kubernetes owns
+  # the generated ResourceClaims and their allocation subresources.
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaimtemplates"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["*"]
+  - apiGroups: ["cluster.x-k8s.io"]
+    resources: ["clusters", "machinedeployments"]
+    verbs: ["*"]
+  - apiGroups: ["controlplane.cluster.x-k8s.io"]
+    resources: ["kubeadmcontrolplanes"]
+    verbs: ["*"]
+  - apiGroups: ["infrastructure.cluster.x-k8s.io"]
+    resources: ["kubevirtmachinetemplates", "kubevirtclusters"]
+    verbs: ["*"]
+  - apiGroups: ["bootstrap.cluster.x-k8s.io"]
+    resources: ["kubeadmconfigtemplates"]
+    verbs: ["*"]
+  - apiGroups: ["addons.cluster.x-k8s.io"]
+    resources: ["clusterresourcesets"]
+    verbs: ["*"]
+  - apiGroups: ["kubeovn.io"]
+    resources: ["*"]
+    verbs: ["get", "list"]
+  - apiGroups: ["kube-dc.com"]
+    resources: ["organizations"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Custom verbs checked by protect-organization-policy: the admin console sets
+  # an organization's explicit spec.quota ("allocate") and spec.suspension ("suspend").
+  - apiGroups: ["kube-dc.com"]
+    resources: ["organizations"]
+    verbs: ["allocate", "suspend"]
+  # Admin console group management (controllers/admin/groupsController.js)
+  # creates/deletes OrganizationGroup CRs in the org namespace.
+  - apiGroups: ["kube-dc.com"]
+    resources: ["organizationgroups"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Read-only on Projects so the observability launch endpoint can
+  # resolve the per-Project Grafana Org id annotation as the backend
+  # SA (the user's bearer token can't be used here on prefix-style
+  # structured-authn clusters — see resolveProjectGrafanaOrgId in
+  # ui/backend/controllers/observabilityModule.js for why).
+  # The admin console creates, edits (quota), stamps and deletes Project CRs
+  # (controllers/admin/organizationController.js createProject / patchProjectQuota /
+  # deleteProject, projectForceDelete.js). Without these verbs every admin-side
+  # project mutation is a 403 on the backend service account.
+  - apiGroups: ["kube-dc.com"]
+    resources: ["projects"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  # Admin Networking page lists and deletes EIp/FIp CRs
+  # (controllers/admin/organizationController.js deleteEIP/deleteFIP).
+  - apiGroups: ["kube-dc.com"]
+    resources: ["eips", "fips"]
+    verbs: ["get", "list", "delete"]
+  # Tenant-VLAN fabric (controllers/admin/vlanController.js). All three kinds
+  # are CLUSTER-SCOPED, so a namespaced tenant Role cannot grant them and a
+  # ClusterRole would necessarily be cluster-wide — either way a tenant cannot
+  # be given a namespace-limited view of them. The backend therefore reads them
+  # with THIS identity and authorizes the caller separately: the admin API
+  # behind requirePlatformAdmin/requireSuperadmin, and the tenant project view
+  # behind a SelfSubjectAccessReview against the caller's own token
+  # (controllers/networkModule.js project-networks). Granting a tenant direct
+  # access instead would leak every other org's VLAN grants — see the tenant
+  # Role contract in internal/chartcontract/project_network_test.go.
+  - apiGroups: ["kube-dc.com"]
+    resources: ["fabricsegments", "projectnetworks"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # Project-scoped VM address choices read only the owning subnet's arena,
+  # after caller RBAC; tenants receive no cluster-wide reservation access.
+  - apiGroups: ["kube-dc.com"]
+    resources: ["addressarenas"]
+    verbs: ["get"]
+  # Per-org VLAN pools (docs/prd/tenant-vlan-org-pool.md). The allocation decides
+  # which ORGANIZATION may bind a wire, so writing one is a platform-admin act:
+  # the admin console does it with this identity behind requireSuperadmin, and
+  # the org-facing console only ever READS allocations here (filtered to the
+  # caller's own organization by name AND pinned UID) because tenants
+  # deliberately hold no direct access to the kind at all.
+  - apiGroups: ["kube-dc.com"]
+    resources: ["fabricsegmentallocations"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # Read-only: the reservation is the controller's proof of exclusive ownership
+  # of a wire. The console shows who holds a segment; it must never write one,
+  # because a hand-written reservation would defeat the storage-atomic
+  # exclusivity that keeps two projects off the same broadcast domain.
+  - apiGroups: ["kube-dc.com"]
+    resources: ["vlanreservations"]
+    verbs: ["get", "list"]
+  {{- if .Values.routedNetwork.enabled }}
+  # Routed-network endpoints perform caller authorization and organization
+  # filtering in the backend before using this service-account identity. Never
+  # return an unfiltered cluster-scoped collection to a tenant endpoint.
+  - apiGroups: ["kube-dc.com"]
+    resources: ["routingfabrics", "routednetworkallocations"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["kube-dc.com"]
+    resources: ["projectrouteattachments", "projectroutinggateways"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
+  # Admin Workloads page lists and deletes tenant databases (KdcDatabase)
+  # (controllers/admin/organizationController.js deleteDatabase).
+  - apiGroups: ["db.kube-dc.com"]
+    resources: ["kdcdatabases"]
+    verbs: ["get", "list", "delete"]
+  # Admin Clusters page lists and deletes managed clusters (KdcCluster)
+  # (controllers/admin/organizationController.js getClusters/deleteCluster).
+  - apiGroups: ["k8s.kube-dc.com"]
+    resources: ["kdcclusters"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: ["hnc.x-k8s.io"]
+    resources: ["hierarchicalresourcequotas", "hierarchicalresourcequotas/status"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["create", "get", "list", "watch"]
+  # Object Storage: CephObjectStoreUser quota + S3 keys from rook-ceph.
+  # cephclusters/cephblockpools/cephobjectstores are read by the admin console
+  # Storage -> Ceph tab (GET /api/admin/storage/ceph -> getCephStorage), which
+  # inspects the CephCluster + pool CRs directly. Without them the endpoint 403s
+  # and the UI shows "Failed to fetch Ceph storage state" (no user workaround
+  # should be needed — this must work out of the box).
+  - apiGroups: ["ceph.rook.io"]
+    resources:
+      - cephobjectstoreusers
+      - cephclusters
+      - cephblockpools
+      - cephobjectstores
+    verbs: ["get", "list"]
+  - apiGroups: ["objectbucket.io"]
+    resources: ["objectbucketclaims", "objectbuckets"]
+    verbs: ["get", "list"]
+  # Flux reconciliation (Reconciliation admin page): get/list for the read view;
+  # patch for the admin actions — force-sync (reconcile.fluxcd.io/requestedAt
+  # annotation) and suspend/resume (spec.suspend). See
+  # controllers/admin/reconciliationController.js.
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources: ["kustomizations"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: ["helmreleases"]
+    verbs: ["get", "list", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kube-dc.backend.serviceAccountName" . }}
+  labels:
+    {{- include "kube-dc.backend.labels" . | nindent 4 }}
+  {{- with .Values.backend.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "kube-dc.backend.serviceAccountName" . }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "kube-dc.backend.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}

@@ -1,0 +1,77 @@
+# HTTP Service Exposure Example
+# Exposes a simple web application via HTTP on port 80
+#
+# This example uses automatic route creation via service annotations.
+# The controller will automatically create:
+# - EIP (external IP allocation)
+# - Backend (for Gateway routing)
+# - HTTPRoute (with auto-generated hostname)
+#
+# Auto-generated hostname format: {service}-{namespace}.{base_domain}
+# Example: my-app-demo.stage.kube-dc.com
+#
+# Prerequisites:
+# - Project with cloud networking (egressNetworkType: cloud)
+#
+# Usage:
+#   kubectl apply -f 01-http-service.yaml
+#
+# Test:
+#   curl http://my-app-{namespace}.{base_domain}
+---
+# Sample application deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  labels:
+    app: my-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+          name: http
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+---
+# LoadBalancer Service with automatic route exposure
+# The controller will auto-create: EIP, Backend, and HTTPRoute
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-app
+  annotations:
+    # Automatically expose via HTTP route
+    # Creates: Backend + HTTPRoute with auto-generated hostname
+    service.nlb.kube-dc.com/expose-route: "http"
+    
+    # Optional: Custom hostname (overrides auto-generated)
+    # service.nlb.kube-dc.com/route-hostname: "my-app.example.com"
+    
+    # Optional: Specific port for multi-port services
+    # service.nlb.kube-dc.com/route-port: "80"
+spec:
+  type: LoadBalancer
+  selector:
+    app: my-app
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+    protocol: TCP

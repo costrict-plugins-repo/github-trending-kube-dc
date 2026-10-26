@@ -1,0 +1,777 @@
+// Package initform is the T6 Phase-1 wizard for `kube-dc bootstrap
+// init` (installer-agentic-implementation-plan §11.T6 + the OS-5
+// object-storage screen from installer-object-storage-scaffold.md §7).
+//
+// **Thin-generator contract** (the load-bearing rule): the form
+// populates the SAME `clusterinit.InitOptions` fields the flags do —
+// per-field validators delegate to the exported clusterinit checks,
+// and after submit the normal `Validate → BuildPlan → Render →
+// confirm → Apply` path runs unchanged. No TUI-only semantics;
+// anything the wizard produces is expressible as flags (the final
+// group shows the equivalent command line for scripting).
+//
+// v1 scope note: this is the STANDALONE huh runner launched by the
+// cobra layer when `init` starts in a TTY with no --name. Embedding
+// into the root screen router (formDoneMsg dispatch) + teatest
+// snapshots are the T6 polish half, tracked in the tracker row.
+// Probe-driven pre-fill (node list / StorageClass picker) is OS-5
+// §7.2's "when a kubeconfig is available" enhancement — free-text
+// with the shared validators is the designed degraded path and what
+// v1 ships.
+package initform
+
+import (
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/shalb/kube-dc/cli/internal/bootstrap/clusterinit"
+)
+
+// State collects the raw form answers. Kept as a separate struct
+// (rather than writing into InitOptions mid-form) so Apply() is a
+// pure, testable mapping and a cancelled form leaves the options
+// untouched.
+type State struct {
+	// basics
+	Name, Domain, NodeIP, Email                                                                               string
+	InstallationKind, ManagedServicesMode, ServicesDatabaseClass, ServicesStorageBudget, ServicesEgressProbes string
+	// SSHHost (user@host) enables the same NAT-topology detection the
+	// flag path does: init SSH-probes whether NodeIP is actually bound on
+	// the node and, behind a 1:1 NAT / cloud FIP, writes the arriving
+	// (internal) IP into NODE_EXTERNAL_IP + drops the 6443 listener
+	// (findings 17/17b). Empty = skip (a node with its public IP bound
+	// locally needs none).
+	SSHHost string
+	// HostID and SSH mappings are installer inputs. ManagementAddress is
+	// inspection metadata; none authorizes a device change by itself.
+	HostID, HostKeySHA256, ManagementAddress, NodeSSHHosts, NodeSSHHostKeys string
+	// mode + fleet
+	Mode      string
+	FleetMode string
+	Repo      string
+	Provider  string
+	Owner     string
+	RepoName  string
+	// network
+	Preset       string
+	NetVLANID    string
+	NetInterface string
+	NodeNICs     string // comma-separated NODE=IFACE overrides
+	// KubeOVNMasterNodes → KUBE_OVN_MASTER_NODES: the control-plane
+	// INTERNAL IPs (comma-separated) kube-ovn binds its master on. Not
+	// in any preset default + not caught by preset validation, but the
+	// install can't come up without it — so the wizard must collect it
+	// (every preset). IPs, not hostnames.
+	KubeOVNMasterNodes string
+	PubVLANID          string
+	PubCIDR            string
+	PubGateway         string
+	PubExclude1        string
+	PubExclude2        string
+	// IngressAddressLayer is THE front-door question: who owns the address
+	// users dial. Everything else about the front door is derived from it.
+	IngressAddressLayer string
+	MetalLBMode         string
+	MetalLBVIP          string
+	MetalLBInterface    string
+	MetalLBLocalASN     string
+	MetalLBPeerASN      string
+	MetalLBPeerAddress  string
+	MetalLBPeerPort     string
+	MetalLBHoldTime     string
+	// network POINTING (operator hardware/topology → o.Sets). GWNodes is
+	// the OVN external-gateway node list (KUBE_OVN_GW_NODES; anchors must be
+	// a subset — the preset cross-checks it); GWType is centralized|
+	// distributed (KUBE_OVN_GW_TYPE).
+	GWNodes string
+	// IngressNodes names the machines that bind :80/:443. Empty is the
+	// RECOMMENDED answer: the gateway nodes are used, which is the only set
+	// that can announce a MetalLB VIP under externalTrafficPolicy=Local.
+	IngressNodes string
+	GWType       string
+	// object storage (OS-5)
+	OSMode    string
+	OSDNode   string
+	OSDSizeGB string
+	OSDDevice string
+	CephNode1 string
+	CephNode2 string
+	CephNode3 string
+	// CephReplicationSize → CEPH_REPLICATION_SIZE: OSD replica count (disk
+	// durability pointer — copies also need separate failure domains). Empty = fleet default.
+	CephReplicationSize string
+	StorageClass        string
+	// rook-ceph-pvc OSD sizing → CEPH_OSD_COUNT / CEPH_OSD_VOLUME_SIZE_GB.
+	// Disk pointers made operator-visible so a prefill/clone round-trips
+	// them through the panel (they were InitOptions-only before). Empty =
+	// fleet default.
+	CephOSDCount      string
+	CephOSDVolumeSize string
+	S3Hostname        string
+	NoS3Exposure      bool
+	NoKubeVirt        bool
+	DisabledConsent   bool
+	// VM root-disk storage (PRD vm-storage-mode). Optional; empty/local =
+	// local-path (the VM default). shared-rbd needs a rook-ceph-* OSMode.
+	// Goldens stay CLI-only (--vm-golden) — the TUI collects the mode.
+	VMStorageMode string
+	// accelerators — thin view over clusterinit.GPUConfig. Node modes and
+	// profiles use the canonical comma-separated CLI/config representation.
+	GPUPlatform, GPUDriverSource                                  string
+	GPUOperatorVersion, NVIDIADriverVersion, NVIDIAToolkitVersion string
+	HAMiEnabled                                                   bool
+	HAMiVersion, HAMiSchedulerVersion                             string
+	GPUNodeModes, GPUProfiles                                     string
+	AllowUnassignedGPUs, VGPUSecretReady                          bool
+	// gates
+	AllowDNSNotReady bool
+	// AllowNoKubevirtEligible → --allow-no-kubevirt-eligible: proceed when
+	// no node exposes /dev/kvm (the M6-T05 NFD gate would otherwise block).
+	// Common for nested/cloud VMs without nested virt — a first-time user on
+	// such a host needs this to complete an install. Default false (the gate
+	// enforces); VM workloads won't schedule until a KVM node exists.
+	AllowNoKubevirtEligible bool
+	// adopt-only: the --allow-unpinned-adopt bypass. Default false
+	// (the SAFE path — pin versions first). Collected only when
+	// Mode==adopt, behind an explicit danger confirmation.
+	AllowUnpinnedAdopt bool
+	// ExtraSets carries every --set overlay key WITHOUT a dedicated field
+	// (EXT_NET_MTU, MetalLB, EXT_NET_ANCHOR_*, EXT_PUBLIC_EXCLUDE_IPS_*,
+	// platform-endpoints, SMTP, quotas, feature flags). Populated by
+	// FromOptions from a prefill/clone and merged back in Apply, so a
+	// cloned config survives the panel round-trip untouched ("host all
+	// variants"). Keyed by the cluster-config.env key.
+	ExtraSets map[string]string
+	// Non-panel inputs, such as TLS file references, VM goldens, and the
+	// starter reference, must survive form previews, drafts, and handoff.
+	RetainedInputs    map[string]string
+	ExplicitEmptySets map[string]bool
+}
+
+// fieldBackedOverlayKeys are the o.Sets/--set keys that HAVE a dedicated
+// panel field (so FromOptions maps them to State fields, not ExtraSets).
+// Every other overlay key round-trips through ExtraSets.
+var fieldBackedOverlayKeys = map[string]bool{
+	"EXT_NET_VLAN_ID": true, "EXT_NET_INTERFACE": true, "KUBE_OVN_MASTER_NODES": true,
+	"EXT_PUBLIC_VLAN_ID": true, "EXT_PUBLIC_CIDR": true, "EXT_PUBLIC_GATEWAY": true,
+	"EXT_PUBLIC_EXCLUDE_IPS_1": true, "EXT_PUBLIC_EXCLUDE_IPS_2": true,
+	"METALLB_MODE": true, "METALLB_FLOATING_IP": true, "METALLB_INTERFACE": true,
+	"METALLB_BGP_LOCAL_ASN": true, "METALLB_BGP_PEER_ASN": true,
+	"METALLB_BGP_PEER_ADDRESS": true, "METALLB_BGP_PEER_PORT": true,
+	"METALLB_BGP_HOLD_TIME": true,
+	"KUBE_OVN_GW_NODES":     true, "KUBE_OVN_GW_TYPE": true, "CEPH_REPLICATION_SIZE": true,
+}
+
+// Apply maps the collected answers onto InitOptions. Pure — no I/O.
+// Numeric/pair parsing errors are returned with the field named so
+// the cobra layer can surface them cleanly (the per-field validators
+// make them near-impossible, but Apply must not trust that).
+func (s *State) Apply(o *clusterinit.InitOptions) error {
+	if len(s.RetainedInputs) > 0 {
+		retained := &clusterinit.InitOptions{}
+		clusterinit.ImportMap(retained, s.RetainedInputs, func(string) bool { return false })
+		// Replace the input fields that have no dedicated form row. In
+		// particular, removing a TLS path must clear the original options
+		// passed to RunPanel, not only a fresh preview scratch object.
+		o.StarterRef = retained.StarterRef
+		o.TLSMode, o.TLSCert, o.TLSKey = retained.TLSMode, retained.TLSCert, retained.TLSKey
+		o.TrustedCABundle = retained.TrustedCABundle
+		o.DNS01Route53ZoneID, o.DNS01Route53Region = retained.DNS01Route53ZoneID, retained.DNS01Route53Region
+		o.DNS01Route53AccessKeyID, o.DNS01Route53SecretKeyFile = retained.DNS01Route53AccessKeyID, retained.DNS01Route53SecretKeyFile
+		o.DNS01CloudflareZone, o.DNS01CloudflareScope = retained.DNS01CloudflareZone, retained.DNS01CloudflareScope
+		o.DNS01CloudflareAPITokenFile = retained.DNS01CloudflareAPITokenFile
+		o.VMGoldens, o.VMGoldensBlock = retained.VMGoldens, retained.VMGoldensBlock
+		o.GPUSharedAllocator = retained.GPUSharedAllocator
+	}
+	// REPLACEMENT model (reviewer P1): State is the complete post-panel
+	// truth, so Apply REBUILDS every panel-owned field rather than layering
+	// onto whatever was prefilled — a cleared field, or a switched
+	// storage/network mode, must not leak the old value. (Non-panel fields
+	// like GitHubToken / NodeNICs / Addons are untouched.)
+	o.Name = strings.TrimSpace(s.Name)
+	o.Domain = strings.TrimSpace(s.Domain)
+	o.NodeExternalIP = strings.TrimSpace(s.NodeIP)
+	o.Email = strings.TrimSpace(s.Email)
+	o.InstallationKind = strings.TrimSpace(s.InstallationKind)
+	o.ManagedServicesMode = strings.TrimSpace(s.ManagedServicesMode)
+	o.ServicesDatabaseClass = strings.TrimSpace(s.ServicesDatabaseClass)
+	o.ServicesStorageBudget = strings.TrimSpace(s.ServicesStorageBudget)
+	o.ServicesEgressProbeURLs = splitComma(s.ServicesEgressProbes)
+	o.SSHHost = strings.TrimSpace(s.SSHHost)
+	o.SSHHostKeySHA256 = strings.TrimSpace(s.HostKeySHA256)
+	o.PrimaryNode = strings.TrimSpace(s.HostID)
+	if err := clusterinit.ValidateInputSpec(map[string]string{clusterinit.KeyNodeSSHHosts: s.NodeSSHHosts, clusterinit.KeyNodeSSHHostKeys: s.NodeSSHHostKeys}); err != nil {
+		return fmt.Errorf("node SSH settings: %w", err)
+	}
+	sshPairs, err := clusterinit.ParseSetPairs(splitComma(s.NodeSSHHosts))
+	if err != nil {
+		return fmt.Errorf("node SSH targets: %w", err)
+	}
+	o.NodeSSHHosts = sshPairs
+	keyPairs, err := clusterinit.ParseSetPairs(splitComma(s.NodeSSHHostKeys))
+	if err != nil {
+		return fmt.Errorf("node SSH host keys: %w", err)
+	}
+	o.NodeSSHHostKeys = keyPairs
+	o.Mode = clusterinit.Mode(s.Mode)
+	o.FleetMode = clusterinit.FleetMode(s.FleetMode)
+	o.Repo = strings.TrimSpace(s.Repo)
+	o.Provider = clusterinit.Provider(s.Provider)
+	o.GitHubOwner = strings.TrimSpace(s.Owner)
+	o.GitHubRepo = strings.TrimSpace(s.RepoName)
+	o.Preset = clusterinit.Preset(s.Preset)
+
+	// Per-node ProviderNetwork exceptions are a first-class panel value.
+	// Rebuild the map so clearing the field removes stale mappings.
+	nicPairs, err := clusterinit.ParseSetPairs(splitComma(s.NodeNICs))
+	if err != nil {
+		return fmt.Errorf("per-node NICs: %w", err)
+	}
+	o.NodeNICs = nicPairs
+
+	// Rebuild the --set overlay from scratch: preserved advanced keys first,
+	// then the field-backed keys on top (a dedicated field always wins over
+	// a stale ExtraSets entry). A cleared field simply isn't written.
+	o.Sets = map[string]string{}
+	setIf := func(k, v string) {
+		if v = strings.TrimSpace(v); v != "" || s.ExplicitEmptySets[k] {
+			o.Sets[k] = v
+		}
+	}
+	for k, v := range s.ExtraSets {
+		o.Sets[k] = strings.TrimSpace(v)
+	}
+	setIf("EXT_NET_VLAN_ID", s.NetVLANID)
+	setIf("EXT_NET_INTERFACE", s.NetInterface)
+	setIf("KUBE_OVN_MASTER_NODES", s.KubeOVNMasterNodes)
+	// The address layer is a DEDICATED option field, not a --set key (Validate
+	// rejects it in Sets so there is exactly one source of truth).
+	if v := strings.TrimSpace(s.IngressAddressLayer); v != "" {
+		o.IngressAddressLayer = v
+	}
+	setIf("METALLB_MODE", s.MetalLBMode)
+	setIf("METALLB_FLOATING_IP", s.MetalLBVIP)
+	setIf("METALLB_INTERFACE", s.MetalLBInterface)
+	setIf("METALLB_BGP_LOCAL_ASN", s.MetalLBLocalASN)
+	setIf("METALLB_BGP_PEER_ASN", s.MetalLBPeerASN)
+	setIf("METALLB_BGP_PEER_ADDRESS", s.MetalLBPeerAddress)
+	setIf("METALLB_BGP_PEER_PORT", s.MetalLBPeerPort)
+	setIf("METALLB_BGP_HOLD_TIME", s.MetalLBHoldTime)
+	setIf("KUBE_OVN_GW_NODES", s.GWNodes)
+	// --ingress-node is a repeatable flag → a dedicated slice field, not a
+	// --set key. Empty stays nil so the gateway-node derivation applies.
+	o.IngressNodes = nil
+	seenIngress := map[string]bool{}
+	for _, n := range strings.Split(s.IngressNodes, ",") {
+		// De-duplicate here, not just in the plan: a repeated name would
+		// otherwise print twice in the equivalent command.
+		if n = strings.TrimSpace(n); n != "" && !seenIngress[n] {
+			seenIngress[n] = true
+			o.IngressNodes = append(o.IngressNodes, n)
+		}
+	}
+	setIf("KUBE_OVN_GW_TYPE", s.GWType)
+	replicas := s.CephReplicationSize
+	if s.OSMode == string(clusterinit.RookCephMultiNode) && replicas == "" {
+		replicas = s.storageReplication()
+	}
+	setIf("CEPH_REPLICATION_SIZE", replicas)
+	// Public-VLAN keys ONLY for the public preset — switching away drops the
+	// stale EXT_PUBLIC_* values (o.Sets was rebuilt fresh).
+	if clusterinit.PresetHasPublicNetwork(clusterinit.Preset(s.Preset)) {
+		setIf("EXT_PUBLIC_VLAN_ID", s.PubVLANID)
+		setIf("EXT_PUBLIC_CIDR", s.PubCIDR)
+		setIf("EXT_PUBLIC_GATEWAY", s.PubGateway)
+		setIf("EXT_PUBLIC_EXCLUDE_IPS_1", s.PubExclude1)
+		setIf("EXT_PUBLIC_EXCLUDE_IPS_2", s.PubExclude2)
+	}
+
+	// Reset ALL mode-specific storage fields, then set for the selected mode
+	// — switching e.g. multi-node → local must not leave stale CephNodes.
+	o.RookMode = clusterinit.RookMode(s.OSMode)
+	o.RookOSDNode, o.RookOSDDevice, o.RookOSDSizeGB = "", "", 0
+	o.CephNodes = nil
+	o.CephStorageClass, o.CephOSDCount, o.CephOSDVolumeSizeGB = "", 0, 0
+	switch o.RookMode {
+	case clusterinit.RookCephLocal:
+		o.RookOSDNode = strings.TrimSpace(s.OSDNode)
+		if v := strings.TrimSpace(s.OSDSizeGB); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return fmt.Errorf("osd size: %w", err)
+			}
+			o.RookOSDSizeGB = n
+		}
+		o.RookOSDDevice = strings.TrimSpace(s.OSDDevice)
+	case clusterinit.RookCephMultiNode:
+		nodes := map[string]string{}
+		for i, raw := range []string{s.CephNode1, s.CephNode2, s.CephNode3} {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				continue
+			}
+			node, dev, ok := strings.Cut(raw, "=")
+			if !ok {
+				return fmt.Errorf("ceph node %d: expected NODE=DEVICE", i+1)
+			}
+			nodes[strings.TrimSpace(node)] = strings.TrimSpace(dev)
+		}
+		if len(nodes) > 0 {
+			o.CephNodes = nodes
+		}
+	case clusterinit.RookCephPVC:
+		o.CephStorageClass = strings.TrimSpace(s.StorageClass)
+		if v := strings.TrimSpace(s.CephOSDCount); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return fmt.Errorf("ceph osd count: %w", err)
+			}
+			o.CephOSDCount = n
+		}
+		if v := strings.TrimSpace(s.CephOSDVolumeSize); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return fmt.Errorf("ceph osd volume size: %w", err)
+			}
+			o.CephOSDVolumeSizeGB = n
+		}
+	}
+	o.S3Hostname = strings.TrimSpace(s.S3Hostname)
+	o.NoS3Exposure = s.NoS3Exposure
+	o.NoKubeVirt = s.NoKubeVirt
+	// VM root-disk storage — the mode only; --vm-golden stays CLI-only.
+	// Empty == local (the writer + Validate both treat it as no-op). The
+	// selector is HIDDEN unless object storage is rook-backed (shared-rbd
+	// needs rbd-pool); clear a stale non-local value the user can no longer
+	// see, so Validate can't fail on a hidden field.
+	vmMode := strings.TrimSpace(s.VMStorageMode)
+	rookBacked := o.RookMode == clusterinit.RookCephLocal ||
+		o.RookMode == clusterinit.RookCephMultiNode ||
+		o.RookMode == clusterinit.RookCephPVC
+	if !rookBacked {
+		vmMode = ""
+	}
+	o.VMStorageMode = clusterinit.VMStorageMode(vmMode)
+	// Rebuild the GPU surface from the panel. Disabled clears all dependent
+	// values so hidden fields cannot leak an earlier enabled configuration.
+	o.GPUPlatform = clusterinit.GPUPlatformMode(strings.TrimSpace(s.GPUPlatform))
+	o.GPUDriverSource = clusterinit.GPUDriverSource(strings.TrimSpace(s.GPUDriverSource))
+	o.GPUOperatorVersion = strings.TrimSpace(s.GPUOperatorVersion)
+	o.NVIDIADriverVersion = strings.TrimSpace(s.NVIDIADriverVersion)
+	o.NVIDIAToolkitVersion = strings.TrimSpace(s.NVIDIAToolkitVersion)
+	o.HAMiEnabled = s.HAMiEnabled
+	o.HAMiVersion = strings.TrimSpace(s.HAMiVersion)
+	o.HAMiSchedulerVersion = strings.TrimSpace(s.HAMiSchedulerVersion)
+	modes, err := clusterinit.ParseGPUNodeModes([]string{s.GPUNodeModes})
+	if err != nil {
+		return fmt.Errorf("GPU node modes: %w", err)
+	}
+	o.GPUNodeModes = modes
+	o.GPUProfiles = splitComma(s.GPUProfiles)
+	o.AllowUnassignedGPUs = s.AllowUnassignedGPUs
+	o.VGPUSecretReady = s.VGPUSecretReady
+	if o.GPUPlatform == clusterinit.GPUPlatformDisabled {
+		o.GPUNodeModes, o.GPUProfiles = nil, nil
+		o.HAMiEnabled, o.AllowUnassignedGPUs, o.VGPUSecretReady = false, false, false
+	}
+	o.AllowDNSNotReady = s.AllowDNSNotReady
+	o.AllowNoKubevirtEligible = s.AllowNoKubevirtEligible
+	// The bypass only carries meaning in adopt mode; never emit it for
+	// install/resume (keeps the plan hash + equivalent flags honest).
+	o.AllowUnpinnedAdopt = s.AllowUnpinnedAdopt && o.Mode == clusterinit.ModeAdopt
+	// Consent gate LAST (reviewer P2): the disabled-consequence consent is
+	// load-bearing — the panel's validationErrors blocks Apply before here
+	// and the huh Confirm blocks declining — but it must run AFTER all field
+	// mapping so the draft-save path (saveDraft → Apply into a scratch,
+	// error ignored) still captures every field, incl. gates, of an
+	// unconsented disabled-mode work-in-progress.
+	if o.RookMode == clusterinit.RookDisabled && !s.DisabledConsent {
+		return fmt.Errorf("object-storage disabled requires the degraded-mode consent (DisabledConsent)")
+	}
+	return nil
+}
+
+// FromOptions overlays a (possibly prefilled) InitOptions onto the State
+// — the inverse of Apply, used to open the wizard PRE-FILLED from
+// --config / KUBE_DC_INIT_* env / flags. Only non-empty values overlay, so
+// it composes over the wizard's defaults (defaults < prefill) without
+// clobbering them with zero values. Pure.
+func (s *State) FromOptions(o *clusterinit.InitOptions) {
+	s.RetainedInputs = clusterinit.ExportMap(o)
+	set := func(dst *string, v string) {
+		if strings.TrimSpace(v) != "" {
+			*dst = strings.TrimSpace(v)
+		}
+	}
+	set(&s.Name, o.Name)
+	set(&s.Domain, o.Domain)
+	set(&s.NodeIP, o.NodeExternalIP)
+	set(&s.Email, o.Email)
+	set(&s.InstallationKind, o.InstallationKind)
+	set(&s.ManagedServicesMode, o.ManagedServicesMode)
+	set(&s.ServicesDatabaseClass, o.ServicesDatabaseClass)
+	set(&s.ServicesStorageBudget, o.ServicesStorageBudget)
+	set(&s.ServicesEgressProbes, strings.Join(o.ServicesEgressProbeURLs, ","))
+	set(&s.SSHHost, o.SSHHost)
+	set(&s.HostKeySHA256, o.SSHHostKeySHA256)
+	set(&s.HostID, o.PrimaryNode)
+	if len(o.NodeSSHHosts) > 0 {
+		pairs := make([]string, 0, len(o.NodeSSHHosts))
+		for _, node := range clusterinit.SpecOrderedKeys(o.NodeSSHHosts) {
+			pairs = append(pairs, node+"="+o.NodeSSHHosts[node])
+		}
+		s.NodeSSHHosts = strings.Join(pairs, ",")
+	}
+	if len(o.NodeSSHHostKeys) > 0 {
+		pairs := make([]string, 0, len(o.NodeSSHHostKeys))
+		for _, node := range clusterinit.SpecOrderedKeys(o.NodeSSHHostKeys) {
+			pairs = append(pairs, node+"="+o.NodeSSHHostKeys[node])
+		}
+		s.NodeSSHHostKeys = strings.Join(pairs, ",")
+	}
+	// The wizard is deliberately EXPLICIT: its Mode selector has no "auto"
+	// entry (auto is a probe, not a choice). Cobra now defaults --mode to
+	// auto, so seed the panel with install — the greenfield default and the
+	// value the embedded root wizard already starts at — instead of an
+	// out-of-set value that Enter/Left would silently rotate.
+	if o.Mode == clusterinit.ModeAuto {
+		set(&s.Mode, string(clusterinit.ModeInstall))
+	} else {
+		set(&s.Mode, string(o.Mode))
+	}
+	set(&s.FleetMode, string(o.FleetMode))
+	set(&s.Repo, o.Repo)
+	set(&s.Provider, string(o.Provider))
+	set(&s.Owner, o.GitHubOwner)
+	set(&s.RepoName, o.GitHubRepo)
+	set(&s.Preset, string(o.Preset))
+	if len(o.NodeNICs) > 0 {
+		keys := make([]string, 0, len(o.NodeNICs))
+		for node := range o.NodeNICs {
+			keys = append(keys, node)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, node := range keys {
+			parts = append(parts, node+"="+o.NodeNICs[node])
+		}
+		s.NodeNICs = strings.Join(parts, ",")
+	}
+	if o.Sets != nil {
+		setOverlay := func(dst *string, key string) {
+			if v, ok := o.Sets[key]; ok {
+				*dst = strings.TrimSpace(v)
+				if s.ExplicitEmptySets == nil {
+					s.ExplicitEmptySets = map[string]bool{}
+				}
+				s.ExplicitEmptySets[key] = v == ""
+			}
+		}
+		setOverlay(&s.NetVLANID, "EXT_NET_VLAN_ID")
+		setOverlay(&s.NetInterface, "EXT_NET_INTERFACE")
+		setOverlay(&s.KubeOVNMasterNodes, "KUBE_OVN_MASTER_NODES")
+		setOverlay(&s.GWNodes, "KUBE_OVN_GW_NODES")
+		set(&s.IngressNodes, strings.Join(o.IngressNodes, ","))
+		setOverlay(&s.GWType, "KUBE_OVN_GW_TYPE")
+		setOverlay(&s.CephReplicationSize, "CEPH_REPLICATION_SIZE")
+		setOverlay(&s.PubVLANID, "EXT_PUBLIC_VLAN_ID")
+		setOverlay(&s.PubCIDR, "EXT_PUBLIC_CIDR")
+		setOverlay(&s.PubGateway, "EXT_PUBLIC_GATEWAY")
+		setOverlay(&s.PubExclude1, "EXT_PUBLIC_EXCLUDE_IPS_1")
+		setOverlay(&s.PubExclude2, "EXT_PUBLIC_EXCLUDE_IPS_2")
+		set(&s.IngressAddressLayer, o.IngressAddressLayer)
+		setOverlay(&s.MetalLBMode, "METALLB_MODE")
+		setOverlay(&s.MetalLBVIP, "METALLB_FLOATING_IP")
+		setOverlay(&s.MetalLBInterface, "METALLB_INTERFACE")
+		setOverlay(&s.MetalLBLocalASN, "METALLB_BGP_LOCAL_ASN")
+		setOverlay(&s.MetalLBPeerASN, "METALLB_BGP_PEER_ASN")
+		setOverlay(&s.MetalLBPeerAddress, "METALLB_BGP_PEER_ADDRESS")
+		setOverlay(&s.MetalLBPeerPort, "METALLB_BGP_PEER_PORT")
+		setOverlay(&s.MetalLBHoldTime, "METALLB_BGP_HOLD_TIME")
+		// Every other overlay key (no dedicated field) → ExtraSets, so a
+		// prefilled/cloned config survives the panel untouched.
+		for k, v := range o.Sets {
+			if fieldBackedOverlayKeys[k] {
+				continue
+			}
+			if s.ExtraSets == nil {
+				s.ExtraSets = map[string]string{}
+			}
+			s.ExtraSets[k] = v
+		}
+	}
+	set(&s.OSMode, string(o.RookMode))
+	set(&s.VMStorageMode, string(o.VMStorageMode))
+	set(&s.OSDNode, o.RookOSDNode)
+	if o.RookOSDSizeGB > 0 {
+		s.OSDSizeGB = strconv.Itoa(o.RookOSDSizeGB)
+	}
+	set(&s.OSDDevice, o.RookOSDDevice)
+	if len(o.CephNodes) > 0 {
+		nodes := make([]string, 0, len(o.CephNodes))
+		for n := range o.CephNodes {
+			nodes = append(nodes, n)
+		}
+		sort.Strings(nodes)
+		slots := []*string{&s.CephNode1, &s.CephNode2, &s.CephNode3}
+		for i, n := range nodes {
+			if i < len(slots) {
+				*slots[i] = n + "=" + o.CephNodes[n]
+			}
+		}
+	}
+	set(&s.StorageClass, o.CephStorageClass)
+	if o.CephOSDCount > 0 {
+		s.CephOSDCount = strconv.Itoa(o.CephOSDCount)
+	}
+	if o.CephOSDVolumeSizeGB > 0 {
+		s.CephOSDVolumeSize = strconv.Itoa(o.CephOSDVolumeSizeGB)
+	}
+	set(&s.S3Hostname, o.S3Hostname)
+	set(&s.GPUPlatform, string(o.GPUPlatform))
+	set(&s.GPUDriverSource, string(o.GPUDriverSource))
+	set(&s.GPUOperatorVersion, o.GPUOperatorVersion)
+	set(&s.NVIDIADriverVersion, o.NVIDIADriverVersion)
+	set(&s.NVIDIAToolkitVersion, o.NVIDIAToolkitVersion)
+	s.HAMiEnabled = o.HAMiEnabled
+	set(&s.HAMiVersion, o.HAMiVersion)
+	set(&s.HAMiSchedulerVersion, o.HAMiSchedulerVersion)
+	if len(o.GPUNodeModes) > 0 {
+		s.GPUNodeModes = gpuNodeModesString(o.GPUNodeModes)
+	}
+	if len(o.GPUProfiles) > 0 {
+		s.GPUProfiles = strings.Join(o.GPUProfiles, ",")
+	}
+	s.AllowUnassignedGPUs = o.AllowUnassignedGPUs
+	s.VGPUSecretReady = o.VGPUSecretReady
+	if o.NoS3Exposure {
+		s.NoS3Exposure = true
+	}
+	if o.NoKubeVirt {
+		s.NoKubeVirt = true
+	}
+	if o.AllowDNSNotReady {
+		s.AllowDNSNotReady = true
+	}
+	if o.AllowNoKubevirtEligible {
+		s.AllowNoKubevirtEligible = true
+	}
+	if o.AllowUnpinnedAdopt {
+		s.AllowUnpinnedAdopt = true
+	}
+}
+
+// EquivalentFlags renders the flag invocation that reproduces this
+// form state — printed after submit so a reviewed interactive run is
+// trivially scriptable (thin-generator contract made visible).
+func (s *State) EquivalentFlags(o *clusterinit.InitOptions) string {
+	var b strings.Builder
+	b.WriteString("kube-dc bootstrap init \\\n")
+	add := func(flag, val string) {
+		if val != "" {
+			fmt.Fprintf(&b, "  --%s=%s \\\n", flag, shellQuote(val))
+		}
+	}
+	add("name", o.Name)
+	add("domain", o.Domain)
+	add("node-external-ip", o.NodeExternalIP)
+	add("ssh-host", o.SSHHost)
+	add("ssh-host-key-sha256", o.SSHHostKeySHA256)
+	add("primary-node", o.PrimaryNode)
+	for _, node := range clusterinit.SpecOrderedKeys(o.NodeSSHHosts) {
+		add("node-ssh-host", node+"="+o.NodeSSHHosts[node])
+	}
+	for _, node := range clusterinit.SpecOrderedKeys(o.NodeSSHHostKeys) {
+		add("node-ssh-host-key", node+"="+o.NodeSSHHostKeys[node])
+	}
+	add("email", o.Email)
+	add("installation-kind", o.InstallationKind)
+	add("managed-services", o.ManagedServicesMode)
+	add("services-database-class", o.ServicesDatabaseClass)
+	add("services-storage-budget", o.ServicesStorageBudget)
+	for _, probe := range o.ServicesEgressProbeURLs {
+		add("services-egress-probe", probe)
+	}
+	add("mode", string(o.Mode))
+	add("fleet-mode", string(o.FleetMode))
+	add("repo", o.Repo)
+	if o.Provider != "" && o.Provider != clusterinit.ProviderGitHub {
+		add("provider", string(o.Provider))
+	}
+	add("github-owner", o.GitHubOwner)
+	add("github-repo", o.GitHubRepo)
+	add("preset", string(o.Preset))
+	add("starter-ref", o.StarterRef)
+	add("tls-mode", o.TLSMode)
+	add("tls-cert", o.TLSCert)
+	add("tls-key", o.TLSKey)
+	add("trusted-ca-bundle", o.TrustedCABundle)
+	add("dns01-route53-zone-id", o.DNS01Route53ZoneID)
+	add("dns01-route53-region", o.DNS01Route53Region)
+	add("dns01-route53-access-key-id", o.DNS01Route53AccessKeyID)
+	add("dns01-route53-secret-key-file", o.DNS01Route53SecretKeyFile)
+	add("dns01-cloudflare-zone", o.DNS01CloudflareZone)
+	add("dns01-cloudflare-api-token-file", o.DNS01CloudflareAPITokenFile)
+	// Front door. Both are dedicated flags rather than --set keys, so the
+	// generic Sets loop below cannot emit them — and an equivalent command
+	// missing the layer would silently re-run as "none".
+	add("ingress-address-layer", o.IngressAddressLayer)
+	for _, n := range o.IngressNodes {
+		add("ingress-node", n)
+	}
+	keys := make([]string, 0, len(o.Sets))
+	for k := range o.Sets {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		add("set", k+"="+o.Sets[k])
+	}
+	nicKeys := make([]string, 0, len(o.NodeNICs))
+	for node := range o.NodeNICs {
+		nicKeys = append(nicKeys, node)
+	}
+	sort.Strings(nicKeys)
+	for _, node := range nicKeys {
+		add("node-nic", node+"="+o.NodeNICs[node])
+	}
+	add("object-storage-mode", string(o.RookMode))
+	if o.RookMode == clusterinit.RookCephLocal {
+		add("rook-osd-node", o.RookOSDNode)
+		if o.RookOSDSizeGB > 0 {
+			add("rook-osd-size-gb", strconv.Itoa(o.RookOSDSizeGB))
+		}
+		add("rook-osd-device", o.RookOSDDevice)
+	}
+	nodeKeys := make([]string, 0, len(o.CephNodes))
+	for k := range o.CephNodes {
+		nodeKeys = append(nodeKeys, k)
+	}
+	sort.Strings(nodeKeys)
+	for _, k := range nodeKeys {
+		add("ceph-node", k+"="+o.CephNodes[k])
+	}
+	add("ceph-storage-class", o.CephStorageClass)
+	if o.CephOSDCount > 0 {
+		add("ceph-osd-count", strconv.Itoa(o.CephOSDCount))
+	}
+	if o.CephOSDVolumeSizeGB > 0 {
+		add("ceph-osd-volume-size-gb", strconv.Itoa(o.CephOSDVolumeSizeGB))
+	}
+	add("s3-hostname", o.S3Hostname)
+	if o.NoS3Exposure {
+		b.WriteString("  --no-s3-exposure \\\n")
+	}
+	if o.NoKubeVirt {
+		b.WriteString("  --no-kubevirt \\\n")
+	}
+	// PAYG has no panel row; it arrives from --config (KUBE_DC_INIT_PAYG) and
+	// must survive into the command the operator is shown to re-run.
+	if o.PAYG {
+		b.WriteString("  --payg \\\n")
+	}
+	// VM root-disk storage — only emit when non-default (local is the
+	// default; omitting the flag is equivalent). Goldens come from the CLI
+	// (not the TUI) but round-trip here so a prefilled invocation reproduces.
+	if o.VMStorageMode != "" && o.VMStorageMode != clusterinit.VMStorageLocal {
+		add("vm-storage-mode", string(o.VMStorageMode))
+		for _, g := range o.VMGoldens {
+			add("vm-golden", g)
+		}
+		for _, g := range o.VMGoldensBlock {
+			add("vm-golden-block", g)
+		}
+	}
+	if o.AllowDNSNotReady {
+		b.WriteString("  --allow-dns-not-ready \\\n")
+	}
+	if o.AllowNoKubevirtEligible {
+		b.WriteString("  --allow-no-kubevirt-eligible \\\n")
+	}
+	if o.AllowUnpinnedAdopt {
+		b.WriteString("  --allow-unpinned-adopt \\\n")
+	}
+	add("gpu-platform", string(o.GPUPlatform))
+	if o.GPUPlatform != clusterinit.GPUPlatformDisabled {
+		add("gpu-shared-allocator", string(o.GPUSharedAllocator))
+		add("gpu-driver-source", string(o.GPUDriverSource))
+		add("gpu-operator-version", o.GPUOperatorVersion)
+		add("nvidia-driver-version", o.NVIDIADriverVersion)
+		add("nvidia-toolkit-version", o.NVIDIAToolkitVersion)
+		if o.HAMiEnabled {
+			b.WriteString("  --hami-enabled \\\n")
+		}
+		add("hami-version", o.HAMiVersion)
+		add("hami-scheduler-version", o.HAMiSchedulerVersion)
+		for _, pair := range strings.Split(gpuNodeModesString(o.GPUNodeModes), ",") {
+			add("gpu-node-mode", pair)
+		}
+		for _, profile := range o.GPUProfiles {
+			add("gpu-profile", profile)
+		}
+		if o.AllowUnassignedGPUs {
+			b.WriteString("  --allow-unassigned-gpus \\\n")
+		}
+		if o.VGPUSecretReady {
+			b.WriteString("  --vgpu-secret-ready \\\n")
+		}
+	}
+	b.WriteString("  --dry-run")
+	return b.String()
+}
+
+func splitComma(raw string) []string {
+	var out []string
+	for _, item := range strings.Split(raw, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func gpuNodeModesString(m map[string]clusterinit.GPUNodeMode) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+string(m[k]))
+	}
+	return strings.Join(parts, ",")
+}
+
+// validateOptionalInt accepts empty (defaulted) or a positive integer.
+func validateOptionalInt(s string) error {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n <= 0 {
+		return fmt.Errorf("positive integer (or empty for the default)")
+	}
+	return nil
+}
+
+// shellQuote makes a flag value safe to paste into a POSIX shell
+// (reviewer P3: "script-ready" must survive repo paths with spaces).
+// Values made purely of safe chars pass through untouched; anything
+// else is single-quoted with embedded quotes escaped.
+func shellQuote(s string) string {
+	if s != "" && strings.IndexFunc(s, func(r rune) bool {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return false
+		case strings.ContainsRune("@%_+=:,./-", r):
+			return false
+		}
+		return true
+	}) == -1 {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}

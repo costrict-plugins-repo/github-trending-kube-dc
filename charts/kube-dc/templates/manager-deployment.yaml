@@ -1,0 +1,411 @@
+{{- if and (include "kube-dc.manager.failClosedAdmission" .) (lt (int .Values.manager.replicaCount) 2) (not .Values.manager.singleReplicaAdmissionAccepted) }}
+{{- fail "This installation has fail-closed manager admission (projectNetwork, routedNetwork, managed-services protection or exposure route claims) and requires manager.replicaCount >= 2: with one replica, every rollout, drain or eviction is a window in which tenant pods, claims and Secrets cannot be created, and a node loss is an outage. Set manager.replicaCount to at least 2 (and ensure two nodes match manager.nodeSelector), or set manager.singleReplicaAdmissionAccepted=true to accept a not-highly-available installation." }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kube-dc.manager.fullname" . }}
+  labels:
+    {{- include "kube-dc.manager.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "kube-dc.manager.selectorLabels" . | nindent 6 }}
+  replicas: {{ .Values.manager.replicaCount }}
+  template:
+    metadata:
+      annotations:
+        # Rolls the manager Pod whenever the master-config Secret content
+        # changes. The Secret is rendered from chart values
+        # (manager.allowPublicProjects, network-isolation flags, etc.) —
+        # flipping any of those means the in-memory ConfigGlobal.MasterConfig
+        # cache in the running manager is stale until restart. The checksum
+        # here forces Helm to roll the Deployment on Secret change.
+        # See kube-dc/docs/prd/public-projects-gate.md (F2 review fix).
+        checksum/master-config: {{ include (print $.Template.BasePath "/manager-secret.yaml") . | sha256sum }}
+        # The service-family registry is read once at startup: a change must
+        # roll the manager or the new family is not recognised.
+        checksum/service-families: {{ include (print $.Template.BasePath "/manager-service-families.yaml") . | sha256sum }}
+        {{- with .Values.manager.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "kube-dc.manager.selectorLabels" . | nindent 8 }}
+        {{- include "kube-dc.podVersionLabel" . | nindent 8 }}
+        {{- with .Values.manager.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.manager.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if include "kube-dc.manager.highlyAvailableAdmission" . }}
+      # Fail-closed admission must survive a node loss.
+      # minDomains=2 is load-bearing: replicaCount=2 without placement can put
+      # both webhook endpoints on one node and only looks highly available.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          minDomains: 2
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              {{- include "kube-dc.manager.selectorLabels" . | nindent 14 }}
+      {{- end }}
+      containers:
+      - command:
+        - /manager
+        args:
+          - --leader-elect
+          - --health-probe-bind-address=:8081
+          - --config-secret-name=master-config
+          - --config-secret-namespace=$(NAMESPACE)
+          - --zap-log-level={{ .Values.manager.logLevel | default "1" }}
+          - --keycloak-debug={{ .Values.manager.keycloakDebug | default "false" }}
+          - --grafana-tenant-mode={{ .Values.manager.grafanaTenantMode | default "org" }}
+          - --pod-ip-conflict-remediation={{ .Values.manager.podIPConflict.mode | default "observe" }}
+          - --pod-ip-conflict-all-projects={{ .Values.manager.podIPConflict.allProjects | default false }}
+          - --address-reservation-mode={{ (.Values.manager.addressReservation).mode | default "dryrun" }}
+
+          - --static-ip-fence-action={{ .Values.manager.staticIPFence.action }}
+          - --address-reservation-all-projects={{ (.Values.manager.addressReservation).allProjects | default false }}
+          {{- with (.Values.manager.addressReservation).vipPoolCIDR }}
+          # Pin the project-internal LoadBalancer VIP pool. An EXISTING cluster
+          # must keep the CIDR its arenas were built with: changing it revokes
+          # every live delegation until an operator migrates.
+          - --vip-pool-cidr={{ . }}
+          {{- end }}
+          {{- if .Values.manager.metrics.enabled }}
+          - --metrics-bind-address=:{{ .Values.manager.metrics.service.port }}
+          - --metrics-secure=true
+          {{- else }}
+          - --metrics-bind-address=0
+          {{- end }}
+          {{- if .Values.manager.pprof.enabled }}
+          {{- if not (regexMatch `^127[.]0[.]0[.]1:[0-9]+$` .Values.manager.pprof.bindAddress) }}
+          {{- fail "manager.pprof.bindAddress must use IPv4 loopback (for example 127.0.0.1:6060); pprof may contain sensitive runtime data" }}
+          {{- end }}
+          - --pprof-bind-address={{ .Values.manager.pprof.bindAddress }}
+          {{- end }}
+        env:
+          # The reserved object-storage admin identity. The manager refuses to
+          # manage an organization of this name, because such an organization
+          # would resolve to the platform's own CephObjectStoreUser and Secret.
+          # Threaded from the same value that creates the user, so the two
+          # cannot drift — see templates/s3-platform-admin-user.yaml.
+          - name: SERVICES_DATABASE_TLS_NAMESPACE
+            value: {{ required "managedServiceCredentials.databaseTLSNamespace is required" .Values.managedServiceCredentials.databaseTLSNamespace | quote }}
+          - name: SERVICES_PUBLICATION_ESO_SERVICE_ACCOUNT
+            value: {{ include "kube-dc.publicationESO.serviceAccount" . | quote }}
+          - name: SERVICES_ARCHIVE_BROKER_ROTATION_ENABLED
+            value: {{ .Values.managedServiceCredentials.archiveBrokerRotationEnabled | default false | quote }}
+          - name: SERVICES_ARCHIVE_LIVE_WRITER_HANDOFF_ENABLED
+            value: {{ .Values.managedServiceCredentials.archiveLiveWriterHandoffEnabled | default false | quote }}
+          # C05 installation gate; the manager treats absent/unparsable as off.
+          - name: SERVICES_DATABASE_ENGINE_ENABLED
+            value: {{ dig "databaseEngine" "enabled" false .Values.managedServiceCredentials | toString | quote }}
+          - name: SERVICES_DATABASE_SELF_DATAPLANE_NAME
+            value: {{ dig "databaseEngine" "selfDataPlaneName" "" .Values.managedServiceCredentials | quote }}
+          - name: SERVICES_DATABASE_READER_COORDINATOR_ENABLED
+            value: {{ dig "databaseEngine" "readerCoordinatorEnabled" false .Values.managedServiceCredentials | toString | quote }}
+          {{- $readerCoordinator := eq (toString (dig "databaseEngine" "readerCoordinatorEnabled" false .Values.managedServiceCredentials)) "true" }}
+          {{- $readerPolicy := eq (toString (dig "databaseEngine" "readerClearancePolicyEnabled" false .Values.managedServiceCredentials)) "true" }}
+          {{- if and $readerPolicy (not $readerCoordinator) }}
+          {{- fail "managedServiceCredentials.databaseEngine.readerClearancePolicyEnabled requires readerCoordinatorEnabled" }}
+          {{- end }}
+          - name: SERVICES_DATABASE_READER_POLICY_ENABLED
+            value: {{ $readerPolicy | quote }}
+          # C05 BaoReplicasQualified: the OpenBao StatefulSet whose every
+          # replica must run the plugin init container from this digest.
+          {{- $databaseBao := dig "databaseEngine" "openBao" dict .Values.managedServiceCredentials }}
+          {{- $pluginDigest := $databaseBao.pluginImageDigest | default "" }}
+          {{- if and $pluginDigest (not (regexMatch "^sha256:[a-f0-9]{64}$" $pluginDigest)) }}
+          {{- fail "managedServiceCredentials.databaseEngine.openBao.pluginImageDigest must be sha256:<64 lowercase hex>" }}
+          {{- end }}
+          - name: SERVICES_DATABASE_BAO_NAMESPACE
+            value: {{ $databaseBao.namespace | default "openbao" | quote }}
+          - name: SERVICES_DATABASE_BAO_STATEFULSET
+            value: {{ $databaseBao.statefulSet | default "openbao" | quote }}
+          - name: SERVICES_DATABASE_PLUGIN_INIT_CONTAINER
+            value: {{ $databaseBao.pluginInitContainer | default "kube-dc-postgresql-plugin" | quote }}
+          - name: SERVICES_DATABASE_PLUGIN_IMAGE_DIGEST
+            value: {{ $pluginDigest | quote }}
+          - name: SERVICES_CELL_NAMESPACE
+            value: {{ required "managedServiceCredentials.cellNamespace is required" .Values.managedServiceCredentials.cellNamespace | quote }}
+          - name: ROOK_NAMESPACE
+            value: {{ .Values.objectStorage.rookNamespace | quote }}
+          - name: CEPH_STORE_NAME
+            value: {{ .Values.objectStorage.cephStoreName | quote }}
+          {{- if .Values.s3Endpoint }}
+          - name: S3_ENDPOINT
+            value: {{ .Values.s3Endpoint | quote }}
+          {{- end }}
+          - name: S3_PLATFORM_ADMIN_USER
+            value: {{ .Values.objectStorage.platformAdminUser.name | quote }}
+          # Automatic Project spec.cidrBlock allocation uses the same pool as
+          # the backend's CIDR suggestion (values.yaml backend.projectCidr).
+          {{- with .Values.backend.projectCidr }}
+          - name: PROJECT_CIDR_POOL
+            value: {{ .pool | quote }}
+          - name: PROJECT_CIDR_PREFIX
+            value: {{ .prefix | quote }}
+          - name: PROJECT_CIDR_RESERVED
+            value: {{ join "," .reserved | quote }}
+          {{- end }}
+          # Platform ServiceAccount namespaces the managed-services token gate
+          # exempts; the same list the protect-managed-services policy uses.
+          - name: MANAGED_SERVICES_EXEMPT_SA_NAMESPACES
+            value: {{ join "," (include "kube-dc.managedServices.exemptNamespaces" . | fromJsonArray) | quote }}
+          # "attested" (default): a registered chain may climb a non-controller
+          # owner edge (Strimzi's StrimziPodSet -> KafkaNodePool) once the
+          # manager has observed the owner-forgery guard and the marker policy
+          # refuse an impersonated tenant, for intermediates created after
+          # that; "off": controller references only (policy maintenance).
+          - name: KUBE_DC_NON_CONTROLLER_OWNER_EDGES
+            value: {{ .Values.manager.nonControllerOwnerEdges | default "attested" | quote }}
+          # db-manager and every registered family's operator are marking
+          # identities: what they create carrying the platform's markers keeps
+          # them (the child mutator would otherwise strip the markers from an
+          # object whose owner is not marked -- db-manager's objects under the
+          # tenant's KdcDatabase, Strimzi's ownerless data claims -- and the
+          # re-labelling UPDATE is refused by the marker-introduction policy).
+          - name: KUBE_DC_MARKING_SERVICE_ACCOUNTS
+            value: {{ include "kube-dc.markingServiceAccounts" . | quote }}
+          - name: NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          # The manager needs to distinguish "this cluster sells plans" from
+          # "this org has not been assigned one yet". Without it, an empty
+          # planId looks identical in both cases and object storage is skipped
+          # forever on a billing-less install. Passed unconditionally (unlike
+          # the backend, which only receives it when provider != none) because
+          # the absence of the variable is itself ambiguous.
+          - name: BILLING_PROVIDER
+            value: "{{ .Values.billing.provider }}"
+          {{- if .Values.manager.infraAttachment.enabled }}
+          {{- if not (contains "{namespace}" .Values.manager.infraAttachment.securityGroup) }}
+          {{- fail "manager.infraAttachment.securityGroup must contain {namespace}" }}
+          {{- end }}
+          # Tenant Networking v2 — infra-attachment pod webhook config. All
+          # cluster-specific; see docs/prd/tenant-networking-v2.md.
+          - name: INFRA_ATTACHMENT_SUBNET
+            value: {{ required "manager.infraAttachment.subnet is required when infraAttachment is enabled" .Values.manager.infraAttachment.subnet | quote }}
+          - name: INFRA_ATTACHMENT_GATEWAY
+            value: {{ required "manager.infraAttachment.gateway is required when infraAttachment is enabled" .Values.manager.infraAttachment.gateway | quote }}
+          - name: INFRA_ATTACHMENT_SG
+            value: {{ required "manager.infraAttachment.securityGroup is required when infraAttachment is enabled" .Values.manager.infraAttachment.securityGroup | quote }}
+          - name: INFRA_ATTACHMENT_ROUTES
+            value: {{ required "manager.infraAttachment.routes is required when infraAttachment is enabled" .Values.manager.infraAttachment.routes | quote }}
+          {{- /* "none" is the CLI's persistable "deliberately no rule"; the manager's contract is IP-or-empty. */ -}}
+          {{- $vip := .Values.manager.infraAttachment.platformIngressVIP }}
+          {{- $haveVIP := and $vip (ne $vip "none") }}
+          {{- /* Refuse the contradiction here rather than rendering a Deployment
+                 that silently drops BOTH variables: the manager would then see
+                 the opt-in as false, its own orphan validation would never fire,
+                 and importers would stay blocked with no error anywhere. */ -}}
+          {{- if and .Values.manager.infraAttachment.platformIngressWorkloadEgress (not $haveVIP) }}
+          {{- fail "manager.infraAttachment.platformIngressWorkloadEgress requires a platformIngressVIP (an IPv4 address, not empty and not \"none\"): there is no address to allow" }}
+          {{- end }}
+          {{- if $haveVIP }}
+          - name: INFRA_ATTACHMENT_PLATFORM_INGRESS_VIP
+            value: {{ $vip | quote }}
+          {{- if .Values.manager.infraAttachment.platformIngressWorkloadEgress }}
+          - name: INFRA_ATTACHMENT_PLATFORM_INGRESS_WORKLOAD_EGRESS
+            value: "true"
+          {{- end }}
+          {{- end }}
+          {{- if eq .Values.managementAPI.mode "service" }}
+          - name: MANAGEMENT_API_SERVICE_IP
+            value: {{ required "managementAPI.serviceIP is required in service mode" .Values.managementAPI.serviceIP | quote }}
+          - name: MANAGEMENT_API_SERVICE_CIDR
+            value: {{ required "managementAPI.serviceCIDR is required in service mode" .Values.managementAPI.serviceCIDR | quote }}
+          {{- end }}
+          {{- end }}
+          # Tenant-VLAN attachment. False (the default) means the controller
+          # creates no Vlan, Subnet, or NetworkAttachmentDefinition, so no
+          # wire becomes reachable.
+          - name: PROJECT_NETWORK_ENABLED
+            value: {{ .Values.projectNetwork.enabled | quote }}
+          - name: FIP_SOURCE_POLICY_ENABLED
+            value: {{ .Values.manager.fipSourcePolicy.enabled | quote }}
+          - name: FIP_SOURCE_POLICY_NAMESPACE_UIDS
+            value: {{ toJson .Values.manager.fipSourcePolicy.namespaceUIDs | quote }}
+          - name: EXPOSURE_ROUTE_TRUSTED_PRODUCERS
+            value: {{ join "," .Values.manager.webhook.exposureRouteTrustedProducers | quote }}
+          - name: EXPOSURE_ROUTE_PRODUCER_NAMESPACE_UIDS
+            value: {{ .Values.manager.webhook.exposureRouteProducerNamespaceUIDs | toJson | quote }}
+          - name: EXPOSURE_ACME_CONTROLLER_USERNAME
+            value: {{ .Values.manager.webhook.exposureACMEControllerUsername | quote }}
+          - name: EXPOSURE_ACME_PLATFORM_NAMESPACE_UIDS
+            value: {{ toJson .Values.manager.webhook.exposureACMEPlatformNamespaceUIDs | quote }}
+          - name: EXPOSURE_ROUTE_CONTROLLER_USERNAME
+            value: {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "kube-dc.manager.serviceAccountName" .) | quote }}
+          - name: PROJECT_NETWORK_CONTROLLER_USERNAME
+            value: {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "kube-dc.manager.serviceAccountName" .) | quote }}
+          - name: KUBE_DC_SERVICE_FAMILIES_FILE
+            value: /etc/kube-dc/service-families/families.yaml
+          - name: PROJECT_NETWORK_KUBE_OVN_CONTROLLER_USERNAME
+            value: {{ required "projectNetwork.kubeOvnControllerUsername is required when projectNetwork is enabled" .Values.projectNetwork.kubeOvnControllerUsername | quote }}
+          # The ADMIN console assigns and reclaims VLANs with the backend's own
+          # service-account token, behind requirePlatformAdmin. Without this the
+          # per-org grant webhook would reject every assignment made through the
+          # admin UI. Tenant-facing VLAN endpoints forward the caller's token
+          # instead, so they are judged as the org admin, not as this account.
+          - name: PROJECT_NETWORK_BACKEND_USERNAME
+            value: {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "kube-dc.backend.serviceAccountName" .) | quote }}
+          # Routed Networks + BGP. The feature remains fully inert while this
+          # value is false; controller startup also verifies all four CRDs.
+          - name: ROUTED_NETWORK_ENABLED
+            value: {{ .Values.routedNetwork.enabled | quote }}
+          - name: ROUTED_NETWORK_BACKEND
+            value: {{ .Values.routedNetwork.backend | quote }}
+          - name: ROUTED_NETWORK_NAMESPACE
+            value: {{ .Values.routedNetwork.namespace | quote }}
+          - name: ROUTED_NETWORK_GATEWAY_IMAGE
+            value: {{ .Values.routedNetwork.gatewayImage | quote }}
+          - name: ROUTED_NETWORK_FRR_IMAGE
+            value: {{ .Values.routedNetwork.frrImage | quote }}
+          - name: ROUTED_NETWORK_LINK_POOL
+            value: {{ .Values.routedNetwork.routingLinkPool | quote }}
+          - name: ROUTED_NETWORK_CONTROLLER_USERNAME
+            value: {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "kube-dc.manager.serviceAccountName" .) | quote }}
+          - name: ROUTED_NETWORK_KUBE_OVN_CONTROLLER_USERNAME
+            value: {{ required "routedNetwork.kubeOvnControllerUsername is required when routedNetwork is enabled" .Values.routedNetwork.kubeOvnControllerUsername | quote }}
+          # Platform trust-bundle distribution (docs/prd/platform-trust-bundle.md).
+          # The manager copies this ConfigMap's certificates into every ConfigMap
+          # labelled kube-dc.com/inject-trusted-ca=true, in any namespace — which
+          # is how CDI, tenant workloads and future components get the private CA
+          # without each needing its own chart value and mount. Defaults to the
+          # same ConfigMap the manager already trusts, so a private-CA install
+          # gets distribution for free.
+          {{- $trustSource := default .Values.manager.trustedCA.configMapName .Values.platformTrustBundle.configMapName }}
+          {{- if $trustSource }}
+          - name: PLATFORM_TRUST_BUNDLE_CONFIGMAP
+            value: {{ $trustSource | quote }}
+          - name: PLATFORM_TRUST_BUNDLE_NAMESPACE
+            value: {{ .Release.Namespace | quote }}
+          {{- end }}
+          - name: PLATFORM_TRUST_BUNDLE_INCLUDE_SYSTEM_ROOTS
+            value: {{ .Values.platformTrustBundle.includeSystemRoots | quote }}
+          {{- if .Values.manager.trustedCA.configMapName }}
+          # Additional CA roots for clusters whose platform hostnames are
+          # served by a PRIVATE CA (internal domain, no public issuer). The
+          # manager calls the platform's own https endpoints -- notably the
+          # Keycloak token endpoint -- and without these roots every
+          # Organization reconcile dies with
+          #   cant login to keycloak: x509: certificate signed by unknown authority
+          #
+          # SSL_CERT_DIR (not SSL_CERT_FILE): Go reads the distro bundle AND
+          # every file in SSL_CERT_DIR, so this ADDS roots instead of
+          # replacing the system trust store.
+          - name: SSL_CERT_DIR
+            value: {{ .Values.manager.trustedCA.mountPath | quote }}
+          {{- end }}
+          {{- with .Values.manager.extraEnv }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
+
+        image: "{{ .Values.manager.image.repository }}:{{ .Values.manager.image.tag | default .Chart.AppVersion }}{{ with .Values.manager.image.digest }}@{{ . }}{{ end }}"
+        # manager.image.pullPolicy existed in values.yaml and was set to Always
+        # by the fleet, but this template never referenced it — so the container
+        # silently took Kubernetes' default (IfNotPresent for a non-:latest tag).
+        # Re-pushing a tag then had no effect on a node that had already cached
+        # it, which reads as "my fix didn't deploy" rather than "the image was
+        # never re-pulled".
+        imagePullPolicy: {{ .Values.manager.image.pullPolicy }}
+        name: manager
+        securityContext:
+          allowPrivilegeEscalation: true
+          capabilities:
+            add:
+            - "ALL"
+          privileged: true
+        {{- if or .Values.manager.webhook.enabled .Values.manager.metrics.enabled }}
+        ports:
+          {{- if .Values.manager.webhook.enabled }}
+          - name: webhook-server
+            containerPort: 9443
+            protocol: TCP
+          {{- end }}
+          {{- if .Values.manager.metrics.enabled }}
+          - name: metrics
+            containerPort: {{ .Values.manager.metrics.service.port }}
+            protocol: TCP
+          {{- end }}
+        {{- end }}
+        volumeMounts:
+          {{- if .Values.manager.webhook.enabled }}
+          - name: webhook-cert
+            mountPath: /tmp/k8s-webhook-server/serving-certs
+            readOnly: true
+          {{- end }}
+          {{- if .Values.manager.trustedCA.configMapName }}
+          - name: trusted-ca
+            mountPath: {{ .Values.manager.trustedCA.mountPath | quote }}
+            readOnly: true
+          {{- end }}
+          - name: service-families
+            mountPath: /etc/kube-dc/service-families
+            readOnly: true
+          {{- /* The registry is read from /etc/kube-dc/service-families/families.yaml; a mount at, below or above that path could shadow it with data the policies were not rendered from. */}}
+          {{- range .Values.manager.extraVolumeMounts }}{{ $mp := clean (.mountPath | default "") }}{{ if not (hasPrefix "/" $mp) }}{{ fail (printf "manager.extraVolumeMounts: %q must be an absolute path" (.mountPath | default "")) }}{{ end }}{{ if or (eq $mp "/") (eq $mp "/etc/kube-dc/service-families") (hasPrefix "/etc/kube-dc/service-families/" $mp) (hasPrefix (printf "%s/" $mp) "/etc/kube-dc/service-families/") }}{{ fail (printf "manager.extraVolumeMounts: %q would shadow the service-family registry at /etc/kube-dc/service-families" .mountPath) }}{{ end }}{{ end }}
+          {{- with .Values.manager.extraVolumeMounts }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        resources:
+          {{- toYaml .Values.manager.resources | nindent 12 }}
+      serviceAccountName: {{ include "kube-dc.manager.serviceAccountName" . }}
+      terminationGracePeriodSeconds: 10
+      volumes:
+        {{- if .Values.manager.webhook.enabled }}
+        - name: webhook-cert
+          secret:
+            secretName: {{ include "kube-dc.manager.fullname" . }}-webhook-serving-cert
+            defaultMode: 420
+        {{- end }}
+        {{- if .Values.manager.trustedCA.configMapName }}
+        - name: trusted-ca
+          configMap:
+            name: {{ .Values.manager.trustedCA.configMapName | quote }}
+        {{- end }}
+        - name: service-families
+          configMap:
+            name: {{ include "kube-dc.manager.fullname" . }}-service-families
+        {{- range .Values.manager.extraVolumes }}{{ if eq (.name | default "") "service-families" }}{{ fail "manager.extraVolumes: the name `service-families` is taken by the service-family registry volume" }}{{ end }}{{ end }}
+        {{- with .Values.manager.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.manager.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.manager.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.manager.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

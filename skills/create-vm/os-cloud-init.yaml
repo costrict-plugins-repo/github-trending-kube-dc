@@ -1,0 +1,59 @@
+# Reference fragments only. Use the live OS catalog's default user and the
+# cloud-init rendered by the Kube-DC VM wizard when it differs.
+#
+# QEMU Guest Agent is required for accessCredentials key injection, readiness,
+# and IP reporting.
+
+---
+family: debian-systemd
+examples:
+  - ubuntu
+  - debian
+cloud_user: "{catalog-default-user}"
+cloud_init: |
+  #cloud-config
+  package_update: true
+  packages:
+    - qemu-guest-agent
+  runcmd:
+    - systemctl enable --now qemu-guest-agent
+
+---
+family: rpm-systemd
+examples:
+  - centos-stream
+  - fedora
+cloud_user: "{catalog-default-user}"
+cloud_init: |
+  #cloud-config
+  package_update: true
+  packages:
+    - qemu-guest-agent
+  runcmd:
+    - systemctl enable --now qemu-guest-agent
+    # Keep SELinux enforcing. Apply only guest-agent policy booleans that exist
+    # in the selected image; do not disable SELinux as a generic workaround.
+    - setsebool -P virt_qemu_ga_manage_ssh 1 || true
+
+---
+family: alpine-openrc
+examples:
+  - alpine
+cloud_user: "{catalog-default-user}"
+cloud_init: |
+  #cloud-config
+  package_update: true
+  packages:
+    - qemu-guest-agent
+  runcmd:
+    - rc-update add qemu-guest-agent default
+    - rc-service qemu-guest-agent start
+
+---
+family: windows-golden
+cloud_user: "{catalog-default-user}"
+cloud_init: null
+notes:
+  - Use the Kube-DC VM wizard's complete UEFI, TPM, Hyper-V, disk, and machine configuration.
+  - The qualified golden image already contains VirtIO drivers, SSH, and QEMU Guest Agent.
+  - Do not apply the generic Linux VM template to Windows.

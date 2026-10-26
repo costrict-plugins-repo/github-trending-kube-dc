@@ -1,0 +1,9 @@
+apiVersion: kube-dc.com/v1
+kind: Organization
+metadata:
+  name: acme
+  namespace: acme
+spec: 
+  description: "ACME organization"
+  email: "noreply@acme.com"
+

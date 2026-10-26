@@ -1,0 +1,86 @@
+# HTTPS Service Exposure Example (Gateway-Terminated TLS)
+# Exposes a web application via HTTPS with automatic certificate issuance.
+# The Gateway terminates TLS - your app just serves plain HTTP!
+#
+# This is the SIMPLEST way to expose an HTTPS service.
+# The controller will automatically create:
+# - EIP (external IP allocation)
+# - Backend (for Gateway routing)
+# - Certificate (via cert-manager)
+# - Gateway Listener (HTTPS with certificate)
+# - HTTPRoute (pointing to the listener)
+#
+# Auto-generated hostname format: {service}-{namespace}.{base_domain}
+# Example: my-secure-app-demo.stage.kube-dc.com
+#
+# Prerequisites:
+# - The platform issues the certificate; no Issuer is needed
+# - Project with cloud networking (egressNetworkType: cloud)
+#
+# Usage:
+#   kubectl apply -f 02-https-service.yaml
+#
+# Verify certificate:
+#   kubectl get certificate my-secure-app-tls
+#
+# Test:
+#   curl https://my-secure-app-{namespace}.{base_domain}
+---
+# Sample application deployment - serves plain HTTP
+# No TLS configuration needed in the app!
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-secure-app
+  labels:
+    app: my-secure-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: my-secure-app
+  template:
+    metadata:
+      labels:
+        app: my-secure-app
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+          name: http
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+---
+# LoadBalancer Service with automatic HTTPS route
+# The controller will auto-create: EIP, Backend, Certificate, Gateway Listener, and HTTPRoute
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-secure-app
+  annotations:
+    # Automatically expose via HTTPS with gateway-terminated TLS
+    # Creates: Certificate + Gateway Listener + HTTPRoute
+    # Gateway terminates TLS - app serves plain HTTP
+    service.nlb.kube-dc.com/expose-route: "https"
+    
+    # Optional: Custom hostname (overrides auto-generated)
+    # service.nlb.kube-dc.com/route-hostname: "my-app.example.com"
+    
+    # Optional: your own dns01 or CA Issuer (default: the platform issuer)
+    # service.nlb.kube-dc.com/tls-issuer: "my-dns01-issuer"
+spec:
+  type: LoadBalancer
+  selector:
+    app: my-secure-app
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+    protocol: TCP

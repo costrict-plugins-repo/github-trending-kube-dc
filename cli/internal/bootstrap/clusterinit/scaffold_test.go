@@ -1,0 +1,881 @@
+package clusterinit
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/shalb/kube-dc/cli/internal/bootstrap/ports"
+)
+
+// fakeScriptRunner emits a canned list of stdout/stderr/exit Lines
+// + records the args it was called with. Lets us exercise Scaffold
+// without forking add-cluster.sh.
+type fakeScriptRunner struct {
+	calls []fakeScriptCall
+	// lines is replayed verbatim through Scaffold's drain.
+	lines []ports.Line
+	// runErr is returned by Run before any lines stream.
+	runErr error
+	// onRun is called inside Run with the destination directory so
+	// the test can write the script's "output files" before the
+	// drain consumes the exit line. Allows simulating either a
+	// happy path (files written, encrypted) or a sad path
+	// (plaintext leak).
+	onRun func(clusterDir string) error
+	// fleetRoot is the absolute repo path so onRun can compute
+	// clusterDir from the args.
+	fleetRoot string
+}
+
+type fakeScriptCall struct {
+	Kind ports.ScriptKind
+	Env  map[string]string
+	Args []string
+}
+
+func TestScaffoldPassesReviewedManagerCountAndSuppressesPythonBytecode(t *testing.T) {
+	fleet := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(fleet, "bootstrap"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fleet, "bootstrap/add-cluster.sh"), []byte("# scaffold-capability: managed-services-v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ name, kind, mode, count string }{
+		{"kube-dc on single", "kube-dc", "on", "1"},
+		{"kube-dc off single", "kube-dc", "off", "1"},
+		{"cloudsigma off single", "cloudsigma", "off", "1"},
+		{"kube-dc on three", "kube-dc", "on", "3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &fakeScriptRunner{runErr: errors.New("stop after env capture")}
+			count, _ := strconv.Atoi(tc.count)
+			err := Scaffold(context.Background(), ScaffoldOptions{
+				Plan: &Plan{ClusterName: "demo", Domain: "example.test", InstallationKind: tc.kind,
+					ManagedServicesMode: tc.mode, ManagerNodes: count, ServicesDatabaseClass: "ceph-block",
+					ServicesStorageBudget: "50Gi", ServicesEgressProbeURLs: []string{"https://ghcr.io/v2/"}},
+				FleetRepo: fleet, NodeExternalIP: "192.0.2.10", Runner: runner,
+			})
+			if err == nil || len(runner.calls) != 1 {
+				t.Fatalf("expected one stopped script call, got %v and %d calls", err, len(runner.calls))
+			}
+			env := runner.calls[0].Env
+			for key, want := range map[string]string{
+				"SCAFFOLD_MANAGER_NODES": tc.count, "SCAFFOLD_SCHEDULABLE_NODES": tc.count,
+				"PYTHONDONTWRITEBYTECODE": "1",
+			} {
+				if env[key] != want {
+					t.Errorf("%s = %q, want %q", key, env[key], want)
+				}
+			}
+		})
+	}
+}
+
+// WithSentinelCallback satisfies the ports.ScriptRunner interface
+// (M5-T01 added this method). The fake doesn't actually wire the
+// callback through Run since no Scaffold/Apply test exercises
+// sentinel-emitting scripts; the method is here for interface
+// completeness so the fake compiles against the port.
+func (f *fakeScriptRunner) WithSentinelCallback(_ ports.SentinelCallback) ports.ScriptRunner {
+	return f
+}
+
+func (f *fakeScriptRunner) Run(ctx context.Context, name ports.ScriptKind, env map[string]string, args ...string) (<-chan ports.Line, error) {
+	f.calls = append(f.calls, fakeScriptCall{Kind: name, Env: env, Args: args})
+	if f.runErr != nil {
+		return nil, f.runErr
+	}
+	if f.onRun != nil {
+		if len(args) >= 1 && f.fleetRoot != "" {
+			if err := f.onRun(filepath.Join(f.fleetRoot, "clusters", args[0])); err != nil {
+				return nil, err
+			}
+		}
+	}
+	out := make(chan ports.Line, len(f.lines)+1)
+	for _, ln := range f.lines {
+		out <- ln
+	}
+	close(out)
+	return out, nil
+}
+
+// --- redactor table ---
+
+func TestRedactAddClusterLine(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "keycloak password redacted",
+			in:   "    KEYCLOAK_ADMIN_PASSWORD: ZqV9bF2nP0mWtL3jXcKa",
+			want: "    KEYCLOAK_ADMIN_PASSWORD: [REDACTED — see secrets.enc.yaml]",
+		},
+		{
+			name: "grafana password with double-space",
+			in:   "    GRAFANA_ADMIN_PASSWORD:  XwQbN7cM2vTyU1eA8sDp",
+			want: "    GRAFANA_ADMIN_PASSWORD:  [REDACTED — see secrets.enc.yaml]",
+		},
+		{
+			name: "minio password redacted",
+			in:   "    LOKI_MINIO_ROOT_PASSWORD: H8jK3lP5qR2sN1mB4xZc",
+			want: "    LOKI_MINIO_ROOT_PASSWORD: [REDACTED — see secrets.enc.yaml]",
+		},
+		// Negative cases — must be passed through unchanged.
+		{
+			name: "status line passthrough",
+			in:   "==> Creating cluster overlay: atlantis",
+			want: "==> Creating cluster overlay: atlantis",
+		},
+		{
+			name: "non-password key passthrough",
+			in:   "    Domain:    kdc.atlantis.example.com",
+			want: "    Domain:    kdc.atlantis.example.com",
+		},
+		{
+			name: "label that mentions PASSWORD but no value",
+			in:   "    (save these somewhere safe — you won't see them again)",
+			want: "    (save these somewhere safe — you won't see them again)",
+		},
+		{
+			name: "PASSWORD as substring of another word",
+			in:   "    WARNING: PASSWORDS were saved encrypted",
+			want: "    WARNING: PASSWORDS were saved encrypted",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactAddClusterLine(tc.in)
+			if got != tc.want {
+				t.Errorf("redact(%q) = %q\nwant %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// --- SOPS encryption verifier ---
+
+func TestVerifySOPSEncrypted_AcceptsCanonicalSOPS(t *testing.T) {
+	// Minimal canonical sops-encrypted shape: `ENC[AES256_GCM,...]`
+	// in a stringData value + a top-level `sops:` mapping.
+	body := `apiVersion: v1
+kind: Secret
+stringData:
+    KEYCLOAK_ADMIN_PASSWORD: ENC[AES256_GCM,data:abc,iv:xyz,type:str]
+sops:
+    age:
+        - recipient: age1xxx
+          enc: |
+              -----BEGIN AGE ENCRYPTED FILE-----
+              -----END AGE ENCRYPTED FILE-----
+    mac: ENC[AES256_GCM,data:mac,iv:miv]
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secrets.enc.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := verifySOPSEncrypted(path); err != nil {
+		t.Errorf("encrypted file should pass, got %v", err)
+	}
+}
+
+func TestVerifySOPSEncrypted_RejectsPlaintext(t *testing.T) {
+	// The exact shape add-cluster.sh writes when sops falls back.
+	body := `apiVersion: v1
+kind: Secret
+metadata:
+    name: cluster-secrets
+    namespace: flux-system
+stringData:
+    KEYCLOAK_ADMIN_PASSWORD: ZqV9bF2nP0mWtL3jXcKa
+    GRAFANA_ADMIN_PASSWORD: XwQbN7cM2vTyU1eA8sDp
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secrets.enc.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	err := verifySOPSEncrypted(path)
+	if !errors.Is(err, ErrScaffoldSecretsNotEncrypted) {
+		t.Fatalf("plaintext should be rejected, got %v", err)
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("error should name the path: %v", err)
+	}
+	if !strings.Contains(err.Error(), "sops -e -i") {
+		t.Errorf("error should include remediation: %v", err)
+	}
+}
+
+func TestVerifySOPSEncrypted_PartialEncryption_Rejected(t *testing.T) {
+	// Defensive: file with the `sops:` block but no `ENC[` markers
+	// in the values (or vice versa) is malformed — refuse.
+	body := `apiVersion: v1
+stringData:
+    KEYCLOAK_ADMIN_PASSWORD: ENC[AES256_GCM,data:abc,iv:xyz,type:str]
+# Note: no sops: footer
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secrets.enc.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	err := verifySOPSEncrypted(path)
+	if !errors.Is(err, ErrScaffoldSecretsNotEncrypted) {
+		t.Fatalf("missing sops footer should be rejected, got %v", err)
+	}
+}
+
+// --- post-process cluster-config.env ---
+
+// --- the no-VIP layer and the placeholder gate ---
+
+// A layer that installs no MetalLB must not be refused over MetalLB
+// placeholders. The starter writes CHANGEME for METALLB_FLOATING_IP and
+// METALLB_INTERFACE unconditionally; under layer=none nothing ever substitutes
+// them (addons.go installs no MetalLB layers and the address-metallb component
+// is not selected), so the blanket placeholder scan refused the exact topology
+// none exists for: a site with NO spare address to give. Found on the first
+// fresh install (mod, 2026-08-09) — the reviewed plan applied cleanly right up
+// to the final scan, then rolled the whole scaffold back.
+func TestPostProcessClusterConfig_NoVIPLayer_BlanksDeadMetalLBPlaceholders(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cluster-config.env")
+	scriptOutput := `# Cluster: pilot
+CLUSTER_NAME=pilot
+DOMAIN=pilot.example.com
+EXT_NET_NAME=ext-cloud
+EXT_NET_VLAN_ID=163
+EXT_NET_INTERFACE=bond0
+METALLB_FLOATING_IP=CHANGEME
+METALLB_INTERFACE=CHANGEME
+POD_CIDR=10.100.0.0/16
+`
+	if err := os.WriteFile(path, []byte(scriptOutput), 0o644); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
+	plan := &Plan{
+		Preset:              PresetCloudVLAN,
+		ClusterName:         "pilot",
+		IngressAddressLayer: AddressLayerNone,
+	}
+	base := map[string]string{"EXT_NET_VLAN_ID": "163", "EXT_NET_INTERFACE": "bond0"}
+	if err := postProcessClusterConfig(path, plan, base, ""); err != nil {
+		t.Fatalf("layer=none must not fail on dead MetalLB placeholders: %v", err)
+	}
+	body, _ := os.ReadFile(path)
+	out := string(body)
+	if strings.Contains(out, "CHANGEME") {
+		t.Errorf("dead placeholders must be blanked, file still contains CHANGEME:\n%s", out)
+	}
+	for _, want := range []string{"METALLB_FLOATING_IP=\n", "METALLB_INTERFACE=\n"} {
+		if !strings.Contains(out+"\n", want) {
+			t.Errorf("expected blanked %q in:\n%s", strings.TrimSpace(want), out)
+		}
+	}
+}
+
+// Under a VIP layer the same placeholders ARE load-bearing (the IPAddressPool
+// renders ${METALLB_FLOATING_IP}/32), so the refusal must stand.
+func TestPostProcessClusterConfig_VIPLayer_StillRefusesMetalLBPlaceholders(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cluster-config.env")
+	scriptOutput := `# Cluster: pilot
+CLUSTER_NAME=pilot
+DOMAIN=pilot.example.com
+EXT_NET_NAME=ext-cloud
+EXT_NET_VLAN_ID=163
+EXT_NET_INTERFACE=bond0
+METALLB_FLOATING_IP=CHANGEME
+METALLB_INTERFACE=CHANGEME
+POD_CIDR=10.100.0.0/16
+`
+	if err := os.WriteFile(path, []byte(scriptOutput), 0o644); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
+	plan := &Plan{
+		Preset:              PresetCloudVLAN,
+		ClusterName:         "pilot",
+		IngressAddressLayer: AddressLayerMetalLBL2,
+	}
+	base := map[string]string{"EXT_NET_VLAN_ID": "163", "EXT_NET_INTERFACE": "bond0"}
+	err := postProcessClusterConfig(path, plan, base, "")
+	if err == nil || !strings.Contains(err.Error(), "METALLB") {
+		t.Fatalf("a VIP layer with placeholder MetalLB values must be refused naming the key, got %v", err)
+	}
+	// NOTE deliberately NOT tested here: an explicit real METALLB_FLOATING_IP
+	// under layer=none is REFUSED by semantic validation ("a reserved address is
+	// not assumed to be the front door") — that refusal is existing, correct
+	// behaviour and has its own coverage. The blanking above only touches
+	// untouched CHANGEME placeholders, so it cannot collide with it.
+}
+
+// Regression (codex docs-accuracy review 2026-08-16): add-cluster.sh seeds
+// KUBE_API_ARRIVAL_IP=CHANGEME on a MetalLB layer (the arrival address IS the
+// operator's VIP, unknown to the script). The blanket placeholder scan used to
+// reject that seed BEFORE scaffold step 8 (ResolveKubeAPIArrivalIP) could
+// substitute the VIP — so every MetalLB greenfield install failed unless the
+// operator hand-set KUBE_API_ARRIVAL_IP. Post-process must resolve it itself.
+func TestPostProcessClusterConfig_MetalLBLayer_ResolvesKubeAPIArrivalIPFromVIP(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cluster-config.env")
+	scriptOutput := `# Cluster: pilot
+CLUSTER_NAME=pilot
+DOMAIN=pilot.example.com
+EXT_NET_NAME=ext-cloud
+EXT_NET_VLAN_ID=163
+EXT_NET_INTERFACE=bond0
+INGRESS_ADDRESS_LAYER=metallb-l2
+METALLB_FLOATING_IP=CHANGEME
+METALLB_INTERFACE=CHANGEME
+KUBE_API_ARRIVAL_IP=CHANGEME
+POD_CIDR=10.100.0.0/16
+`
+	if err := os.WriteFile(path, []byte(scriptOutput), 0o644); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
+	plan := &Plan{
+		Preset:              PresetCloudVLAN,
+		ClusterName:         "pilot",
+		IngressAddressLayer: AddressLayerMetalLBL2,
+	}
+	// A real VIP + interface, as the operator supplies them.
+	sets := map[string]string{
+		"EXT_NET_VLAN_ID": "163", "EXT_NET_INTERFACE": "bond0",
+		"METALLB_FLOATING_IP": "198.51.100.7", "METALLB_INTERFACE": "bond0",
+	}
+	if err := postProcessClusterConfig(path, plan, sets, ""); err != nil {
+		t.Fatalf("a MetalLB layer with a real VIP must scaffold; the seeded KUBE_API_ARRIVAL_IP=CHANGEME must be resolved, got: %v", err)
+	}
+	body, _ := os.ReadFile(path)
+	if !strings.Contains(string(body), "KUBE_API_ARRIVAL_IP=198.51.100.7") {
+		t.Errorf("KUBE_API_ARRIVAL_IP must equal the VIP on a MetalLB layer:\n%s", body)
+	}
+	if strings.Contains(string(body), "CHANGEME") {
+		t.Errorf("no placeholder may survive:\n%s", body)
+	}
+}
+
+// On a none layer the arrival IP is the node's own address (written by the
+// script); post-process must NOT borrow the VIP even if one is present.
+func TestPostProcessClusterConfig_NoneLayer_DoesNotBorrowVIPForArrivalIP(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cluster-config.env")
+	scriptOutput := `# Cluster: pilot
+CLUSTER_NAME=pilot
+DOMAIN=pilot.example.com
+EXT_NET_NAME=ext-cloud
+EXT_NET_VLAN_ID=163
+EXT_NET_INTERFACE=bond0
+INGRESS_ADDRESS_LAYER=none
+KUBE_API_ARRIVAL_IP=192.0.2.11
+METALLB_FLOATING_IP=CHANGEME
+METALLB_INTERFACE=CHANGEME
+POD_CIDR=10.100.0.0/16
+`
+	if err := os.WriteFile(path, []byte(scriptOutput), 0o644); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
+	plan := &Plan{Preset: PresetCloudVLAN, ClusterName: "pilot", IngressAddressLayer: AddressLayerNone}
+	base := map[string]string{"EXT_NET_VLAN_ID": "163", "EXT_NET_INTERFACE": "bond0"}
+	if err := postProcessClusterConfig(path, plan, base, ""); err != nil {
+		t.Fatalf("none layer must post-process: %v", err)
+	}
+	body, _ := os.ReadFile(path)
+	if !strings.Contains(string(body), "KUBE_API_ARRIVAL_IP=192.0.2.11") {
+		t.Errorf("none layer must keep the node's own arrival IP:\n%s", body)
+	}
+}
+
+func TestPostProcessClusterConfig_AppliesPresetOverrides(t *testing.T) {
+	// Simulate what add-cluster.sh wrote: CHANGEME values for
+	// VLAN_ID + INTERFACE. Post-process must replace them with
+	// the operator's --set values via the preset's resolved env.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cluster-config.env")
+	scriptOutput := `# Cluster: atlantis
+CLUSTER_NAME=atlantis
+DOMAIN=kdc.atlantis.example.com
+EXT_NET_NAME=ext-cloud
+EXT_NET_VLAN_ID=CHANGEME
+EXT_NET_INTERFACE=CHANGEME
+POD_CIDR=10.100.0.0/16
+`
+	if err := os.WriteFile(path, []byte(scriptOutput), 0o644); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
+
+	plan := &Plan{
+		Preset:      PresetCloudPublicVLAN,
+		ClusterName: "atlantis",
+		InheritedDefaults: map[string]string{
+			"KUBE_DC_VERSION": "v0.3.63",
+		},
+	}
+	sets := map[string]string{
+		"EXT_NET_VLAN_ID":    "1103",
+		"EXT_NET_INTERFACE":  "bond0",
+		"EXT_PUBLIC_VLAN_ID": "1100",
+		"EXT_PUBLIC_CIDR":    "203.0.113.48/29",
+		"EXT_PUBLIC_GATEWAY": "203.0.113.49",
+	}
+	if err := postProcessClusterConfig(path, plan, sets, ""); err != nil {
+		t.Fatalf("postProcess: %v", err)
+	}
+
+	body, _ := os.ReadFile(path)
+	out := string(body)
+	for _, want := range []string{
+		"EXT_NET_VLAN_ID=1103",
+		"EXT_NET_INTERFACE=bond0",
+		"EXT_PUBLIC_VLAN_ID=1100", // new key appended
+		"EXT_PUBLIC_CIDR=203.0.113.48/29",
+		"EXT_PUBLIC_GATEWAY=203.0.113.49",
+		"KUBE_DC_VERSION=v0.3.63", // inherited
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("env missing %q\nFULL:\n%s", want, out)
+		}
+	}
+	// CHANGEME must be gone.
+	if strings.Contains(out, "CHANGEME") {
+		t.Errorf("CHANGEME placeholders survived post-process:\n%s", out)
+	}
+	// Original comment header preserved.
+	if !strings.Contains(out, "# Cluster: atlantis") {
+		t.Errorf("env header comment lost:\n%s", out)
+	}
+}
+
+func TestPostProcessClusterConfig_OperatorOverrideBeatsInherited(t *testing.T) {
+	// Inherited KUBE_DC_VERSION=v0.3.63 (from siblings) vs operator
+	// --set=KUBE_DC_VERSION=v0.4.0. Operator must win.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cluster-config.env")
+	if err := os.WriteFile(path, []byte("CLUSTER_NAME=test\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	plan := &Plan{
+		Preset:            PresetCloudPublicVLAN,
+		InheritedDefaults: map[string]string{"KUBE_DC_VERSION": "v0.3.63"},
+	}
+	sets := map[string]string{
+		"EXT_NET_VLAN_ID":    "1103",
+		"EXT_NET_INTERFACE":  "bond0",
+		"EXT_PUBLIC_VLAN_ID": "1100",
+		"EXT_PUBLIC_CIDR":    "10.0.0.0/24",
+		"EXT_PUBLIC_GATEWAY": "10.0.0.1",
+		"KUBE_DC_VERSION":    "v0.4.0", // operator override
+	}
+	if err := postProcessClusterConfig(path, plan, sets, ""); err != nil {
+		t.Fatalf("postProcess: %v", err)
+	}
+	body, _ := os.ReadFile(path)
+	if !strings.Contains(string(body), "KUBE_DC_VERSION=v0.4.0") {
+		t.Errorf("operator override should win; got:\n%s", body)
+	}
+	if strings.Contains(string(body), "KUBE_DC_VERSION=v0.3.63") {
+		t.Errorf("inherited value leaked through operator override:\n%s", body)
+	}
+}
+
+// --- Scaffold orchestration ---
+
+func TestScaffold_HappyPath(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "clusters"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeStarterScaffoldSources(t, repo)
+
+	// The fake script "writes" the same files the real script would:
+	// cluster-config.env with CHANGEMEs + an encrypted secrets.enc.yaml.
+	rootKustomization := `apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - flux-system
+  - infrastructure.yaml
+  - platform.yaml
+  - secrets.enc.yaml
+`
+	encryptedSecrets := `apiVersion: v1
+stringData:
+    KEYCLOAK_ADMIN_PASSWORD: ENC[AES256_GCM,data:abc,iv:xyz,type:str]
+sops:
+    mac: ENC[AES256_GCM,data:mac,iv:miv]
+    age:
+        - recipient: age1xxx
+`
+	envBody := `CLUSTER_NAME=atlantis
+DOMAIN=kdc.atlantis.example.com
+EXT_NET_VLAN_ID=CHANGEME
+EXT_NET_INTERFACE=CHANGEME
+`
+	runner := &fakeScriptRunner{
+		fleetRoot: repo,
+		onRun: func(clusterDir string) error {
+			if err := os.MkdirAll(clusterDir, 0o755); err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(clusterDir, "cluster-config.env"), []byte(envBody), 0o644); err != nil {
+				return err
+			}
+			// The real add-cluster.sh also writes infrastructure.yaml; the fake
+			// must too, or WritePublicNetwork has nothing to append the
+			// infra-public-network layer to. Omitting it here would only hide
+			// the failure the writer is designed to raise.
+			if err := os.WriteFile(filepath.Join(clusterDir, "infrastructure.yaml"),
+				[]byte("apiVersion: kustomize.toolkit.fluxcd.io/v1\nkind: Kustomization\nmetadata:\n  name: infra-cni\n  namespace: flux-system\n"), 0o644); err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(clusterDir, "kustomization.yaml"), []byte(rootKustomization), 0o644); err != nil {
+				return err
+			}
+			return os.WriteFile(filepath.Join(clusterDir, "secrets.enc.yaml"), []byte(encryptedSecrets), 0o644)
+		},
+		lines: []ports.Line{
+			{Stream: ports.StreamStdout, Text: "==> Creating cluster overlay: atlantis", Time: time.Now()},
+			// Password echo lines — must be redacted in output.
+			{Stream: ports.StreamStdout, Text: "    KEYCLOAK_ADMIN_PASSWORD: PLAINTEXT_LEAK_CANARY", Time: time.Now()},
+			{Stream: ports.StreamStdout, Text: "    GRAFANA_ADMIN_PASSWORD: PLAINTEXT_LEAK_CANARY", Time: time.Now()},
+			{Stream: ports.StreamExit, Text: "0", Time: time.Now()},
+		},
+	}
+
+	var out bytes.Buffer
+	err := Scaffold(context.Background(), ScaffoldOptions{
+		Plan: &Plan{
+			ClusterName: "atlantis",
+			Domain:      "kdc.atlantis.example.com",
+			Preset:      PresetCloudPublicVLAN,
+		},
+		FleetRepo:      repo,
+		NodeExternalIP: "203.0.113.52",
+		Sets: map[string]string{
+			"EXT_NET_VLAN_ID":    "1103",
+			"EXT_NET_INTERFACE":  "bond0",
+			"EXT_PUBLIC_VLAN_ID": "1100",
+			"EXT_PUBLIC_CIDR":    "203.0.113.48/29",
+			"EXT_PUBLIC_GATEWAY": "203.0.113.49",
+		},
+		Runner: runner,
+		Out:    &out,
+	})
+	if err != nil {
+		t.Fatalf("Scaffold: %v\nout:\n%s", err, out.String())
+	}
+
+	// CRITICAL: PLAINTEXT_LEAK_CANARY must NOT appear in the
+	// captured output — redaction kicked in.
+	if strings.Contains(out.String(), "PLAINTEXT_LEAK_CANARY") {
+		t.Fatalf("password value leaked to operator output:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "[REDACTED — see secrets.enc.yaml]") {
+		t.Errorf("redaction marker missing from output:\n%s", out.String())
+	}
+	// Script args reached the runner correctly.
+	if len(runner.calls) != 1 {
+		t.Fatalf("expected 1 script call, got %d", len(runner.calls))
+	}
+	call := runner.calls[0]
+	if call.Kind != ports.ScriptAddCluster {
+		t.Errorf("script kind = %v, want ScriptAddCluster", call.Kind)
+	}
+	wantArgs := []string{"atlantis", "kdc.atlantis.example.com", "203.0.113.52"}
+	if len(call.Args) != len(wantArgs) {
+		t.Fatalf("args length = %d, want %d (%v)", len(call.Args), len(wantArgs), call.Args)
+	}
+	for i, a := range wantArgs {
+		if call.Args[i] != a {
+			t.Errorf("args[%d] = %q, want %q", i, call.Args[i], a)
+		}
+	}
+	// Post-process kicked in — CHANGEMEs replaced.
+	body, _ := os.ReadFile(filepath.Join(repo, "clusters", "atlantis", "cluster-config.env"))
+	if strings.Contains(string(body), "CHANGEME") {
+		t.Errorf("CHANGEME survived post-process:\n%s", body)
+	}
+	if !strings.Contains(string(body), "EXT_NET_VLAN_ID=1103") {
+		t.Errorf("preset --set didn't apply:\n%s", body)
+	}
+}
+
+func TestScaffold_RefusesExistingTarget(t *testing.T) {
+	// Marker file present = already scaffolded. Operator must clean
+	// up before re-running.
+	repo := t.TempDir()
+	clusterDir := filepath.Join(repo, "clusters", "atlantis")
+	if err := os.MkdirAll(clusterDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(clusterDir, "cluster-config.env"),
+		[]byte("KUBE_DC_VERSION=v0.0.1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &fakeScriptRunner{} // shouldn't be called
+
+	err := Scaffold(context.Background(), ScaffoldOptions{
+		Plan: &Plan{ClusterName: "atlantis", Domain: "kdc.atlantis.example.com",
+			Preset: PresetCloudPublicVLAN},
+		FleetRepo:      repo,
+		NodeExternalIP: "203.0.113.52",
+		Sets:           map[string]string{"EXT_NET_VLAN_ID": "1103", "EXT_NET_INTERFACE": "bond0", "EXT_PUBLIC_VLAN_ID": "1100", "EXT_PUBLIC_CIDR": "10.0.0.0/24", "EXT_PUBLIC_GATEWAY": "10.0.0.1"},
+		Runner:         runner,
+	})
+	if !errors.Is(err, ErrScaffoldTargetExists) {
+		t.Fatalf("expected ErrScaffoldTargetExists, got %v", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Errorf("script must NOT run when target exists; calls=%d", len(runner.calls))
+	}
+}
+
+func TestScaffold_AllowsPreExistingDocsOnly(t *testing.T) {
+	// Operators sometimes pre-place a `docs/` README inside the
+	// overlay (topology notes, etc.) before running bootstrap. The
+	// preflight must not refuse on that — only on the
+	// cluster-config.env marker. We don't run the full Scaffold
+	// here (the script + cobra layer aren't being exercised); we
+	// just confirm the preflight passes and reaches the script
+	// invocation step.
+	repo := t.TempDir()
+	clusterDir := filepath.Join(repo, "clusters", "atlantis", "docs")
+	if err := os.MkdirAll(clusterDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(clusterDir, "README.md"),
+		[]byte("# topology\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Runner returns a non-empty stream so the test doesn't have to
+	// thread the whole add-cluster.sh contract — just confirm the
+	// preflight didn't refuse, by checking the runner was called.
+	// The script "fails" via StreamExit nonzero; we don't care
+	// about Scaffold's overall outcome here, only that the preflight
+	// permitted the call.
+	runner := &fakeScriptRunner{
+		lines: []ports.Line{
+			{Stream: ports.StreamStdout, Text: "ok"},
+			{Stream: ports.StreamExit, Text: "1"},
+		},
+	}
+
+	err := Scaffold(context.Background(), ScaffoldOptions{
+		Plan: &Plan{ClusterName: "atlantis", Domain: "kdc.atlantis.example.com",
+			Preset: PresetCloudPublicVLAN},
+		FleetRepo:      repo,
+		NodeExternalIP: "203.0.113.52",
+		Sets:           map[string]string{"EXT_NET_VLAN_ID": "1103", "EXT_NET_INTERFACE": "bond0"},
+		Runner:         runner,
+	})
+	if errors.Is(err, ErrScaffoldTargetExists) {
+		t.Fatalf("preflight wrongly refused a docs-only overlay: %v", err)
+	}
+	if len(runner.calls) == 0 {
+		t.Errorf("script should have been invoked (preflight passed); got 0 calls")
+	}
+}
+
+func TestScaffold_RefusesPlaintextSecrets(t *testing.T) {
+	// Reviewer P1: script-side sops fallback writes plaintext;
+	// Scaffold must refuse before any downstream commit/push.
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "clusters"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plaintextSecrets := `apiVersion: v1
+stringData:
+    KEYCLOAK_ADMIN_PASSWORD: literal-plaintext-not-good
+`
+	runner := &fakeScriptRunner{
+		fleetRoot: repo,
+		onRun: func(clusterDir string) error {
+			if err := os.MkdirAll(clusterDir, 0o755); err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(clusterDir, "cluster-config.env"), []byte("CLUSTER_NAME=x\n"), 0o644); err != nil {
+				return err
+			}
+			return os.WriteFile(filepath.Join(clusterDir, "secrets.enc.yaml"), []byte(plaintextSecrets), 0o644)
+		},
+		lines: []ports.Line{
+			{Stream: ports.StreamStdout, Text: "==> WARNING: SOPS age key not configured. secrets.enc.yaml is UNENCRYPTED.", Time: time.Now()},
+			{Stream: ports.StreamExit, Text: "0", Time: time.Now()},
+		},
+	}
+	err := Scaffold(context.Background(), ScaffoldOptions{
+		Plan: &Plan{ClusterName: "atlantis", Domain: "kdc.atlantis.example.com",
+			Preset: PresetCloudPublicVLAN},
+		FleetRepo:      repo,
+		NodeExternalIP: "203.0.113.52",
+		Sets:           map[string]string{"EXT_NET_VLAN_ID": "1103", "EXT_NET_INTERFACE": "bond0", "EXT_PUBLIC_VLAN_ID": "1100", "EXT_PUBLIC_CIDR": "10.0.0.0/24", "EXT_PUBLIC_GATEWAY": "10.0.0.1"},
+		Runner:         runner,
+	})
+	if !errors.Is(err, ErrScaffoldSecretsNotEncrypted) {
+		t.Fatalf("expected ErrScaffoldSecretsNotEncrypted, got %v", err)
+	}
+}
+
+func TestScaffold_ScriptNonZeroExit(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, "clusters"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runner := &fakeScriptRunner{
+		fleetRoot: repo,
+		lines: []ports.Line{
+			{Stream: ports.StreamStderr, Text: "ERROR: simulated failure", Time: time.Now()},
+			{Stream: ports.StreamExit, Text: "1", Time: time.Now()},
+		},
+	}
+	err := Scaffold(context.Background(), ScaffoldOptions{
+		Plan: &Plan{ClusterName: "atlantis", Domain: "kdc.atlantis.example.com",
+			Preset: PresetCloudPublicVLAN},
+		FleetRepo:      repo,
+		NodeExternalIP: "203.0.113.52",
+		Sets:           map[string]string{"EXT_NET_VLAN_ID": "1103", "EXT_NET_INTERFACE": "bond0", "EXT_PUBLIC_VLAN_ID": "1100", "EXT_PUBLIC_CIDR": "10.0.0.0/24", "EXT_PUBLIC_GATEWAY": "10.0.0.1"},
+		Runner:         runner,
+	})
+	if !errors.Is(err, ErrScaffoldScriptFailed) {
+		t.Fatalf("expected ErrScaffoldScriptFailed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "exit=1") {
+		t.Errorf("error should report exit code: %v", err)
+	}
+}
+
+// A stream that ends without a terminal exit record must fail the
+// scaffold, not be read as a clean exit 0.
+//
+// drainAndRedactAddCluster used to return (0, nil) in exactly this case,
+// documented as a defensive fallback. It was the opposite: a killed
+// add-cluster.sh or a runner that died mid-run produces precisely this
+// shape, and Scaffold would continue into post-processing believing the
+// overlay had been written.
+func TestScaffold_TruncatedStream_IsFailureNotSuccess(t *testing.T) {
+	repo := t.TempDir()
+	runner := &fakeScriptRunner{
+		fleetRoot: repo,
+		lines: []ports.Line{
+			{Stream: ports.StreamStdout, Text: "==> Creating cluster overlay: atlantis", Time: time.Now()},
+			// No StreamExit record: the stream just ends.
+		},
+	}
+	var out bytes.Buffer
+	err := Scaffold(context.Background(), ScaffoldOptions{
+		Plan: &Plan{
+			ClusterName: "atlantis",
+			Domain:      "kdc.atlantis.example.com",
+			Preset:      PresetCloudPublicVLAN,
+		},
+		FleetRepo:      repo,
+		NodeExternalIP: "203.0.113.52",
+		Sets: map[string]string{
+			"EXT_NET_VLAN_ID":    "1103",
+			"EXT_NET_INTERFACE":  "bond0",
+			"EXT_PUBLIC_VLAN_ID": "1100",
+			"EXT_PUBLIC_CIDR":    "203.0.113.48/29",
+			"EXT_PUBLIC_GATEWAY": "203.0.113.49",
+		},
+		Runner: runner,
+		Out:    &out,
+	})
+	if err == nil {
+		t.Fatal("truncated stream must fail the scaffold, not be synthesized as exit 0")
+	}
+	if !errors.Is(err, ports.ErrStreamTruncated) {
+		t.Errorf("want ports.ErrStreamTruncated, got %v", err)
+	}
+}
+
+// serviceModeViable / auto resolution: a private cluster with dual-homing and a
+// valid service IP must resolve auto -> service (the mgmt-API path that actually
+// works when tenants are VPC-isolated); anything missing falls back to external.
+func TestServiceModeViable(t *testing.T) {
+	cases := []struct {
+		ip, cidr string
+		want     bool
+	}{
+		{"10.101.0.1", "10.101.0.0/16", true},
+		{"10.101.0.1", "10.100.0.0/16", false}, // IP outside CIDR
+		{"", "10.101.0.0/16", false},           // no service IP
+		{"10.101.0.1", "", false},              // no CIDR
+		{"not-an-ip", "10.101.0.0/16", false},
+		{"10.101.0.1", "garbage", false},
+	}
+	for _, c := range cases {
+		if got := serviceModeViable(c.ip, c.cidr); got != c.want {
+			t.Errorf("serviceModeViable(%q,%q)=%v want %v", c.ip, c.cidr, got, c.want)
+		}
+	}
+}
+
+// The management-SNAT placeholder must be RESOLVED by post-process, not
+// refused by its placeholder scan: step 8's file-level ResolveMgmtSnatIP is
+// unreachable past that scan (identical to the KUBE_API_ARRIVAL_IP trap,
+// 2026-08-16). Caught by the greenfield E2E on 2026-09-01 — every fresh
+// install aborted demanding a manual --set.
+func TestPostProcessClusterConfig_DerivesMgmtSnatIPBeforePlaceholderScan(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cluster-config.env")
+	scriptOutput := `# Cluster: pilot
+CLUSTER_NAME=pilot
+DOMAIN=pilot.example.com
+EXT_NET_NAME=ext-cloud
+EXT_NET_VLAN_ID=163
+EXT_NET_INTERFACE=bond0
+EXT_NET_CIDR=100.65.0.0/16
+EXT_NET_GATEWAY=100.65.0.1
+EXT_NET_EXCLUDE_IPS=100.65.0.1
+EXT_NET_MGMT_SNAT_IP=CHANGEME
+POD_CIDR=10.100.0.0/16
+`
+	if err := os.WriteFile(path, []byte(scriptOutput), 0o644); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
+	plan := &Plan{
+		Preset:              PresetCloudVLAN,
+		ClusterName:         "pilot",
+		IngressAddressLayer: AddressLayerNone,
+	}
+	base := map[string]string{"EXT_NET_VLAN_ID": "163", "EXT_NET_INTERFACE": "bond0"}
+	if err := postProcessClusterConfig(path, plan, base, ""); err != nil {
+		t.Fatalf("post-process must derive EXT_NET_MGMT_SNAT_IP, not refuse it: %v", err)
+	}
+	body, _ := os.ReadFile(path)
+	out := string(body)
+	if !strings.Contains(out, "EXT_NET_MGMT_SNAT_IP=100.65.0.2") {
+		t.Errorf("EXT_NET_MGMT_SNAT_IP not derived to first-after-block: %s", out)
+	}
+	if !strings.Contains(out, "EXT_NET_EXCLUDE_IPS=100.65.0.1..100.65.0.2") {
+		t.Errorf("EXT_NET_EXCLUDE_IPS not widened to cover the SNAT address: %s", out)
+	}
+	// An operator-supplied value (with its reservation, as validation
+	// demands) must be left alone.
+	seed2 := strings.ReplaceAll(scriptOutput, "EXT_NET_MGMT_SNAT_IP=CHANGEME", "EXT_NET_MGMT_SNAT_IP=100.65.0.9")
+	seed2 = strings.ReplaceAll(seed2, "EXT_NET_EXCLUDE_IPS=100.65.0.1\n", "EXT_NET_EXCLUDE_IPS=100.65.0.1..100.65.0.9\n")
+	if err := os.WriteFile(path, []byte(seed2), 0o644); err != nil {
+		t.Fatalf("write seed 2: %v", err)
+	}
+	if err := postProcessClusterConfig(path, plan, base, ""); err != nil {
+		t.Fatalf("explicit value must pass: %v", err)
+	}
+	body, _ = os.ReadFile(path)
+	if !strings.Contains(string(body), "EXT_NET_MGMT_SNAT_IP=100.65.0.9") {
+		t.Errorf("explicit operator value was overwritten: %s", string(body))
+	}
+}

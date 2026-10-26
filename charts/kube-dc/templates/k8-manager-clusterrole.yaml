@@ -1,0 +1,552 @@
+{{- if .Values.k8Manager.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kube-dc.k8manager.fullname" . }}
+  labels:
+    {{- include "kube-dc.k8manager.labels" . | nindent 4 }}
+rules:
+# Per-managed-cluster CloudSigma CCM metrics discovery.
+- apiGroups: ["monitoring.coreos.com"]
+  resources: ["servicemonitors"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# BOC #2: read the KamajiControlPlane CRD schema to detect whether the
+# kube-dc-forked control-plane provider is installed (kube-proxy JSON-patch
+# capability gate). Without this the gate fails closed and #2 is silently
+# never written. See kdccluster_kubelet_kubeproxy.go::kcpSupportsKubeProxyJSONPatches.
+- apiGroups:
+  - apiextensions.k8s.io
+  resources:
+  - customresourcedefinitions
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - secrets
+  - serviceaccounts
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - endpoints
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  - statefulsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - bootstrap.cluster.x-k8s.io
+  resources:
+  - kubeadmconfigtemplates
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - cert-manager.io
+  resources:
+  - certificates
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+# Read-only access to cert-manager Issuer and ClusterIssuer resources.
+# Required by reconcileCertificateCARotation in the KdcClusterDatastore
+# controller so it can resolve the Issuer's CA secret and compare the
+# upstream CA Subject Key Identifier against the SKI embedded in
+# leaf cert Secrets it manages. Without this, the drift detector logs
+# "CA rotation: could not resolve Issuer CA, skipping drift check" on
+# every reconcile and never forces leaf re-issuance after a CA rotation.
+- apiGroups:
+  - cert-manager.io
+  resources:
+  - issuers
+  - clusterissuers
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - clusters
+  - machinedeployments
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+# machinesets needs patch for the MS status-drift self-heal annotation
+# (pokeMachineSetIfStatusDrift). machines (read-only) is the ground-truth
+# the self-heal counts to compare against MS.status.readyReplicas.
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - machinesets
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+# machines update + machinedeployments/scale: held so the manager can GRANT
+# them to the per-cluster cluster-autoscaler Role (autoscaling.mode:
+# ClusterAutoscaler) — RBAC no-escalation means the manager delegates only
+# verbs it holds. `machines update` is how upstream CA stamps the
+# delete-machine annotation so the MachineSet removes the node CA drained. A
+# machines update/patch grant was added and reverted once before (b2daf40a)
+# because its consumer was dead code; this consumer deploys with the mode.
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - machines
+  verbs:
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - machinedeployments/scale
+  verbs:
+  - get
+  - patch
+  - update
+# machinepools read-only: held ONLY to delegate to the per-cluster
+# cluster-autoscaler Role. The clusterapi provider starts an informer for
+# every discovered CAPI resource and blocks its cache sync forever on a
+# Forbidden machinepools watch — the autoscaler sat at "Initializing"
+# indefinitely (found on a live cluster). Kube-DC never creates MachinePools.
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - machinepools
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - controlplane.cluster.x-k8s.io
+  resources:
+  - kamajicontrolplanes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
+  - cloudsigmaclusters
+  - cloudsigmamachinetemplates
+  - kubevirtclusters
+  - kubevirtmachinetemplates
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+# kubevirtmachines + cloudsigmamachines: needed by reapOrphanInfraMachineFinalizers
+# in kdccluster_controller.reconcileDelete to strip the infra-provider's own
+# stuck finalizer after CAPI Cluster is gone (cloud incident 2026-06-03 —
+# anup-test had a 1.5-month-old stuck kubevirtmachine blocking ns Terminating).
+# Read+update only; we never create/delete the CRs themselves — CAPI owns
+# their lifecycle. The /finalizers subresource grant covers the finalizer
+# update path on apiservers that gate it separately.
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
+  - cloudsigmamachines
+  - kubevirtmachines
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
+  - cloudsigmamachines/finalizers
+  - kubevirtmachines/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - k8s.kube-dc.com
+  resources:
+  - kdcclusterdatastores
+  - kdcclusters
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - k8s.kube-dc.com
+  resources:
+  - kdcclusterdatastores/finalizers
+  - kdcclusters/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - k8s.kube-dc.com
+  resources:
+  - kdcclusterdatastores/status
+  - kdcclusters/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - security.kube-dc.com
+  resources:
+  - kmskeys
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - kamaji.clastix.io
+  resources:
+  - datastores
+  - tenantcontrolplanes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - kube-dc.com
+  resources:
+  - eips
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ipam.cluster.x-k8s.io
+  resources:
+  - ipaddresses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ipam.cluster.x-k8s.io
+  resources:
+  - ipaddressclaims
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - delete
+- apiGroups:
+  - kube-dc.com
+  resources:
+  - projects
+  verbs:
+  - get
+  - list
+  - watch
+  - update
+  - patch
+# Managed-Kubernetes LoadBalancer blocks (docs/internal/managed-k8s-lb-ipam.md
+# §4.2): the consumer requests/adopts AddressReservations, opts the project
+# namespace in (label), and writes the <cluster>-lb-block ConfigMap.
+- apiGroups:
+  - kubevirt.io
+  resources:
+  - virtualmachineinstances
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - kube-dc.com
+  resources:
+  - addressreservations
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - list
+  - update
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
+  - update
+  - patch
+- apiGroups:
+  - kubevirt.io
+  resources:
+  - virtualmachineinstances
+  verbs:
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - kubevirt.io
+  resources:
+  - virtualmachines
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - networkpolicies
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - rolebindings
+  - roles
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - autoscaling.k8s.io
+  resources:
+  - verticalpodautoscalers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+# Per-cluster etcd snapshot CronJobs created by reconcileBackup.
+# See docs/prd/managed-k8s-etcd-backups.md
+- apiGroups:
+  - batch
+  resources:
+  - cronjobs
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+# Read-only access to ObjectBucketClaims for backup-bucket discovery
+# (the bucket itself is provisioned by the kube-dc Project controller).
+- apiGroups:
+  - objectbucket.io
+  resources:
+  - objectbucketclaims
+  verbs:
+  - get
+  - list
+  - watch
+# Permissions delegated to the per-cluster kubevirt-csi-controller
+# Role that reconcileKubevirtCSI creates. RBAC's "no privilege
+# escalation" rule means the manager can only grant what it itself
+# holds — listing them here lets the manager create the per-tenant
+# Role + RoleBinding without 403 from the apiserver.
+# See shalb/kube-dc docs/prd/tenant-cluster-teardown-gc.md §D1.
+- apiGroups:
+  - cdi.kubevirt.io
+  resources:
+  - datavolumes
+  verbs:
+  - create
+  - delete
+  - get
+- apiGroups:
+  - subresources.kubevirt.io
+  resources:
+  - virtualmachines/addvolume
+  - virtualmachines/removevolume
+  verbs:
+  - update
+- apiGroups:
+  - snapshot.storage.k8s.io
+  resources:
+  - volumesnapshots
+  verbs:
+  - create
+  - delete
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  verbs:
+  - delete
+  - get
+  - list
+  - patch
+  - watch
+# Worker-autoscaling quota rail: a KubeVirt worker is a VMI pod in the
+# cluster's project namespace, so each node it adds is charged against that
+# namespace's quota (the tenant's billing plan). The autoscaler reads it to
+# refuse a scale-up that quota would reject anyway, reporting limitedBy=Quota
+# instead of piling up Machines that admission rejects. Read-only. CloudSigma
+# pools are account VMs and consume no namespace quota, so they are never
+# charged against this.
+#
+# resourcequotas, NOT hierarchicalresourcequotas: the tenant plan is authored
+# as an HRQ in the ORG-ROOT namespace, but a KdcCluster lives in the PROJECT
+# namespace, so a namespace-scoped HRQ read there matches nothing. HNC projects
+# every HRQ into the subtree as a plain ResourceQuota (`hrq.hnc.x-k8s.io`) with
+# identical hard/used, and that projection is what admission actually enforces.
+# BOTH groups are granted, deliberately, and this is not redundancy: a chart
+# upgrade rolls before or after the operator image, in either order, and a
+# rollback reverses it. The PREVIOUS k8-manager reads hierarchicalresourcequotas;
+# this one reads resourcequotas. Granting only the new resource 403s the old pod
+# for the length of the rollout — and for as long as a rollback lasts — which
+# turns a quota read into a scale-up refusal. Keeping both costs two read-only
+# verbs; drop the HNC one only once no supported version reads it.
+- apiGroups:
+  - hnc.x-k8s.io
+  resources:
+  - hierarchicalresourcequotas
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - resourcequotas
+  verbs:
+  - get
+  - list
+  - watch
+{{- end }}
+
+{{- if .Values.k8Manager.mgmtAutoscaling.enabled }}
+# ── Management-worker autoscaling ──────────────────────────────────────────
+# MgmtWorkerPool is the ledger; nodes are labelled/tainted by the acceptance
+# gate. NO node delete: nothing in this feature ever removes a node.
+- apiGroups: [k8s.kube-dc.com]
+  resources: [mgmtworkerpools]
+  verbs: [get, list, watch]
+- apiGroups: [k8s.kube-dc.com]
+  resources: [mgmtworkerpools/status]
+  verbs: [get, update, patch]
+- apiGroups: [""]
+  resources: [nodes]
+  verbs: [get, list, watch, update, patch]
+{{- end }}
+# Project VIP-pool deletion handshake: k8-manager counts the mirror-family
+# switch-lb-rules (durable cluster-UID label) before withdrawing a
+# delegation certificate.
+- apiGroups:
+  - kubeovn.io
+  resources:
+  - switch-lb-rules
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups: [gateway.networking.k8s.io]
+  resources: [gateways]
+  verbs: [get, list, watch]
+- apiGroups: [gateway.networking.k8s.io]
+  resources: [tlsroutes]
+  verbs: [get, list, watch, create, update, patch, delete]

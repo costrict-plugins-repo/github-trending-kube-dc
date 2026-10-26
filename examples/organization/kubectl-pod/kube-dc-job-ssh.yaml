@@ -1,0 +1,66 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kube-dc-ssh
+  namespace: shalb-demo
+  labels:
+    app: kube-dc
+    component: ssh
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: kube-dc
+        component: ssh
+        service: ssh-console
+    spec:
+      terminationGracePeriodSeconds: 2
+      containers:
+      - name: ssh
+        image: shalb/kube-dc-kubectl:v0.4.3
+        ports:
+        - containerPort: 7681
+          name: ttyd
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 7681
+          initialDelaySeconds: 4
+          periodSeconds: 2
+          timeoutSeconds: 2
+          failureThreshold: 8
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 7681
+          initialDelaySeconds: 4
+          periodSeconds: 2
+          timeoutSeconds: 2
+          failureThreshold: 8
+        env:
+        - name: COMMAND
+          value: "ssh_console"
+        - name: ONCE
+          value: "false"
+        - name: TTL
+          value: "1200"
+        - name: OS_IMAGE_USER
+          value: "ubuntu"
+        - name: VMI_IP
+          value: "10.0.10.24"
+        volumeMounts:
+        - mountPath: /usr/local/ssh-private-key/
+          name: ssh-private-key
+          subPath: id_rsa
+          readOnly: true
+      volumes:
+      - name: ssh-private-key
+        secret:
+          defaultMode: 256
+          secretName: ssh-keypair-default
+      restartPolicy: Never
+      # securityContext:
+      #   runAsNonRoot: false
+      #   runAsUser: 0

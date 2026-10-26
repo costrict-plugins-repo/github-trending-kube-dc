@@ -1,0 +1,766 @@
+# =============================================================================
+# Project Role Templates
+# These roles are copied to each project namespace during project creation.
+# =============================================================================
+
+---
+# Admin Role - Full access to all project resources
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: default-project-admin-role
+rules:
+# Core resources
+- apiGroups: [""]
+  resources: [persistentvolumeclaims, services, secrets, serviceaccounts, configmaps]
+  # Explicit verbs: a wildcard would also grant impersonate (ServiceAccounts) and
+  # escalate/bind (Roles, RoleBindings), which let a project identity act as the
+  # managed engines' accounts or mint roles it does not hold.
+  verbs: [get, list, watch, create, update, patch, delete, deletecollection]
+# serviceaccounts/token is a SEPARATE RBAC resource from serviceaccounts: the grant
+# above does not confer it. Without this rule a project admin has no way to obtain a
+# non-interactive credential at all -- `kubectl create token` is Forbidden, and the
+# legacy kubernetes.io/service-account-token Secret is refused by the
+# managed-references webhook (the token controller fills such a Secret with a
+# NON-EXPIRING credential for whichever account holds that name when it gets there,
+# a race no lookup can close). That left CI/CD with no supported path.
+#
+# Safe because the gate already exists: ManagedServiceAccountTokenValidator admits a
+# TokenRequest only for an account WITHOUT services.kube-dc.com/managed-by, so a
+# project admin can mint for their own ci-deploy account but not for a managed
+# engine's (CNPG runs each instance under a ServiceAccount named after its Cluster,
+# in the project namespace). That webhook's own comment anticipates "a project admin
+# who holds create on serviceaccounts/token" -- it was written for this grant.
+#
+# Admin only. Developer, manager and user roles must NOT hold this: minting a
+# credential is an administrative act.
+- apiGroups: [""]
+  resources: [serviceaccounts/token]
+  verbs: [create]
+- apiGroups: [""]
+  resources: [resourcequotas]
+  # ResourceQuotas are owned by the HNC and kube-dc quota controllers. Tenant
+  # mutation would let a project admin spoof quota attribution in API/UI data.
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [limitranges]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [endpoints]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [create, get, list, watch, delete]
+- apiGroups: [""]
+  resources: [pods/log]
+  verbs: [get, list]
+- apiGroups: [""]
+  resources: [events]
+  verbs: [get, list, watch]
+# Metrics (kubectl top pods)
+- apiGroups: [metrics.k8s.io]
+  resources: [pods]
+  verbs: [get, list]
+# Apps
+- apiGroups: [apps]
+  resources: [deployments]
+  verbs: ["*"]
+{{- if .Values.gpu.tenantDirectApply }}
+# Shared GPU (DRA) self-service. The DRA shape admission policies force the exact
+# fixed product and the per-DeviceClass ResourceQuota bounds count, so this grant
+# cannot exceed the project's GPU entitlement.
+- apiGroups: [resource.k8s.io]
+  resources: [resourceclaimtemplates]
+  verbs: [create, get, list, watch, update, patch, delete]
+- apiGroups: [resource.k8s.io]
+  resources: [resourceclaims]
+  verbs: [get, list, watch]
+{{- end }}
+- apiGroups: [apps]
+  resources: [daemonsets, replicasets, statefulsets]
+  verbs: [create, get, list, watch, delete]
+# RBAC
+- apiGroups: [rbac.authorization.k8s.io]
+  resources: [roles, rolebindings]
+  # Explicit verbs: a wildcard would also grant impersonate (ServiceAccounts) and
+  # escalate/bind (Roles, RoleBindings), which let a project identity act as the
+  # managed engines' accounts or mint roles it does not hold.
+  verbs: [get, list, watch, create, update, patch, delete, deletecollection]
+# Networking
+- apiGroups: [k8s.cni.cncf.io]
+  resources: [network-attachment-definitions]
+  verbs: [get, list]
+- apiGroups: [networking.k8s.io]
+  resources: [ingresses]
+  verbs: [create, get, list, watch, delete]
+# KubeVirt VMs
+- apiGroups: [kubevirt.io]
+  resources: [virtualmachines, virtualmachineinstances]
+  verbs: ["*"]
+- apiGroups: [subresources.kubevirt.io]
+  resources: [virtualmachineinstances/guestosinfo, virtualmachineinstances/filesystemlist, virtualmachineinstances/console, virtualmachineinstances/vnc]
+  verbs: [get]
+- apiGroups: [subresources.kubevirt.io]
+  resources: [virtualmachines/start, virtualmachines/stop, virtualmachines/restart, virtualmachines/addvolume, virtualmachines/removevolume, virtualmachines/migrate, virtualmachines/memorydump, virtualmachines/pause]
+  verbs: [update]
+- apiGroups: [subresources.kubevirt.io]
+  resources: [virtualmachineinstances/pause, virtualmachineinstances/unpause, virtualmachineinstances/addvolume, virtualmachineinstances/removevolume, virtualmachineinstances/freeze, virtualmachineinstances/unfreeze, virtualmachineinstances/softreboot, virtualmachineinstances/sev/setupsession, virtualmachineinstances/sev/injectlaunchsecret]
+  verbs: [update]
+- apiGroups: [subresources.kubevirt.io]
+  resources: [virtualmachines/expand-spec]
+  verbs: [update]
+# CDI (Containerized Data Importer)
+- apiGroups: [cdi.kubevirt.io]
+  resources: ["*"]
+  verbs: ["*"]
+# VolumeSnapshots — read golden images for the instant-clone (vm-startup Phase C+D)
+- apiGroups: [snapshot.storage.k8s.io]
+  resources: [volumesnapshots]
+  verbs: [get, list, watch]
+# Autoscaling
+- apiGroups: [autoscaling]
+  resources: [horizontalpodautoscalers]
+  verbs: ["*"]
+# Cluster API (KDC Clusters)
+# Worker inventory is read-only, including for project administrators.
+- apiGroups: [cluster.x-k8s.io]
+  resources: [machines]
+  verbs: [get, list, watch]
+- apiGroups: [cluster.x-k8s.io]
+  resources: [clusters, machinedeployments]
+  verbs: ["*"]
+- apiGroups: [controlplane.cluster.x-k8s.io]
+  resources: [kthreescontrolplanes]
+  verbs: ["*"]
+- apiGroups: [infrastructure.cluster.x-k8s.io]
+  resources: [kubevirtmachinetemplates, kubevirtclusters]
+  verbs: ["*"]
+- apiGroups: [bootstrap.cluster.x-k8s.io]
+  resources: [kthreesconfigtemplates]
+  verbs: ["*"]
+- apiGroups: [addons.cluster.x-k8s.io]
+  resources: [clusterresourcesets]
+  verbs: ["*"]
+# Batch
+- apiGroups: [batch]
+  resources: [jobs]
+  verbs: [create, get, list, watch, delete]
+# CronJobs read — the Danger Zone "Take snapshot now" reads the daily
+# <cluster>-etcd-backup CronJob's jobTemplate so it can create a one-off
+# manual Job from the same spec. Read-only is enough.
+- apiGroups: [batch]
+  resources: [cronjobs]
+  verbs: [get, list, watch]
+# Kube-DC resources
+- apiGroups: [kube-dc.com]
+  resources: [eips, fips]
+  verbs: [create, get, list, watch, delete]
+{{- if .Values.routedNetwork.enabled }}
+- apiGroups: [kube-dc.com]
+  resources: [projectrouteattachments]
+  verbs: [create, get, list, watch, delete]
+{{- end }}
+- apiGroups: [k8s.kube-dc.com]
+  resources: [kdcclusters, kdcclusterdatastores]
+  verbs: [create, get, list, watch, delete, patch, update]
+# Cert-manager
+- apiGroups: [cert-manager.io]
+  resources: [issuers, certificates]
+  verbs: [create, get, list, watch, delete]
+- apiGroups: [acme.cert-manager.io]
+  resources: [challenges]
+  verbs: [get, list, watch, delete]
+# Policy
+- apiGroups: [policy]
+  resources: [poddisruptionbudgets]
+  verbs: [create, get, list, watch, delete]
+# Discovery
+- apiGroups: [discovery.k8s.io]
+  resources: [endpointslices]
+  verbs: [get, list]
+# Gateway API
+- apiGroups: [gateway.networking.k8s.io]
+  resources: [httproutes, grpcroutes, tlsroutes]
+  verbs: [create, get, list, watch, delete, update, patch]
+- apiGroups: [gateway.envoyproxy.io]
+  resources: [backends]
+  verbs: [get, list, watch]
+# Object Storage (Rook-Ceph S3 buckets)
+- apiGroups: [objectbucket.io]
+  resources: [objectbucketclaims]
+  verbs: [create, get, list, watch, delete]
+# Database Service (db-manager)
+- apiGroups: [db.kube-dc.com]
+  resources: [kdcdatabases]
+  verbs: [create, get, list, watch, delete, patch, update]
+# Managed services (kube-dc-services): the tenant-facing objects, same rights
+# as KdcDatabase. Placements are the hub's; readable so status makes sense.
+- apiGroups: [services.kube-dc.com]
+  resources: [managedservices, serviceoperations, servicebindings, servicecredentialpolicies, replicationgroups]
+  verbs: [create, get, list, watch, delete, patch, update]
+# D1: a Project admin registers one of the Project's KdcClusters as a managed
+# services data plane with a ServiceDataPlaneGrant. The spec is immutable, so
+# no update or patch; the hub writes its status.
+- apiGroups: [services.kube-dc.com]
+  resources: [servicedataplanegrants]
+  verbs: [create, get, list, watch, delete]
+- apiGroups: [services.kube-dc.com]
+  resources: [servicedataplanegrants/status]
+  verbs: [get, list, watch]
+- apiGroups: [services.kube-dc.com]
+  resources: [managedservices/status, serviceoperations/status, servicebindings/status, servicecredentialpolicies/status, serviceplacements, serviceplacements/status, servicebackups, servicebackups/status, replicationgroups/status, topologychanges, topologychanges/status]
+  verbs: [get, list, watch]
+# Database Engine Resources (CNPG + MariaDB operator)
+# `clusters` and `mariadbs` reads let the UI surface engine-side recovery
+# progress (status.bootstrap, status.conditions) during a restore.
+- apiGroups: [postgresql.cnpg.io]
+  resources: [backups, scheduledbackups]
+  verbs: [create, get, list, watch, delete]
+- apiGroups: [postgresql.cnpg.io]
+  resources: [clusters]
+  verbs: [get, list, watch]
+- apiGroups: [k8s.mariadb.com]
+  resources: [physicalbackups, backups, databases, users, grants]
+  verbs: [create, get, list, watch, delete]
+- apiGroups: [k8s.mariadb.com]
+  resources: [mariadbs]
+  verbs: [get, list, watch]
+# Velero (Backup & Restore)
+- apiGroups: [velero.io]
+  resources: [backups, restores, schedules, backupstoragelocations]
+  verbs: [create, get, list, watch, delete, update, patch]
+- apiGroups: [velero.io]
+  resources: [backups/status, restores/status]
+  verbs: [get, list, watch]
+# Kube-DC Security Manager (M1+) — admin gets full CRUD on every
+# security CRD in the project namespace. UI/CLI surface lives in
+# the backend; the backend re-uses the user's JWT against the K8s
+# API so these RBAC rules govern what tenants can do without the
+# OpenBao policy layer (defence in depth).
+# Archive rotation affects a shared Project claim and is admin-only. patch sets
+# spec.abandon, once (CEL keeps every other spec field immutable); the
+# kube-dc-archive-rotation-finalizer policy keeps the retirement finalizer
+# with the rotation controller. No update: nothing else is writable.
+- apiGroups: [security.kube-dc.com]
+  resources: [objectbucketkeyrotations]
+  verbs: [create, get, list, watch, delete, patch]
+- apiGroups: [security.kube-dc.com]
+  resources: [managedsecrets, managedcertificates, kmskeys, databasecredentialpolicies]
+  verbs: ["*"]
+- apiGroups: [security.kube-dc.com]
+  resources: [managedsecrets/status, managedcertificates/status, kmskeys/status, databasecredentialpolicies/status]
+  verbs: [get, list, watch]
+
+---
+# Developer Role - Can manage VMs, containers, workloads + project secrets (no RBAC)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: default-project-developer-role
+rules:
+# Core resources (no secrets write)
+- apiGroups: [""]
+  resources: [persistentvolumeclaims, services, serviceaccounts, configmaps]
+  # Explicit verbs: a wildcard would also grant impersonate (ServiceAccounts) and
+  # escalate/bind (Roles, RoleBindings), which let a project identity act as the
+  # managed engines' accounts or mint roles it does not hold.
+  verbs: [get, list, watch, create, update, patch, delete, deletecollection]
+- apiGroups: [""]
+  resources: [secrets]
+  verbs: [get, list]
+- apiGroups: [""]
+  resources: [resourcequotas]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [limitranges]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [endpoints]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [create, get, list, watch, delete]
+- apiGroups: [""]
+  resources: [pods/log]
+  verbs: [get, list]
+- apiGroups: [""]
+  resources: [events]
+  verbs: [get, list, watch]
+# Metrics (kubectl top pods)
+- apiGroups: [metrics.k8s.io]
+  resources: [pods]
+  verbs: [get, list]
+# Apps
+- apiGroups: [apps]
+  resources: [deployments, daemonsets, replicasets, statefulsets]
+  verbs: [create, get, list, watch, delete, update, patch]
+{{- if .Values.gpu.tenantDirectApply }}
+# Shared GPU (DRA) self-service — see admin role note.
+- apiGroups: [resource.k8s.io]
+  resources: [resourceclaimtemplates]
+  verbs: [create, get, list, watch, update, patch, delete]
+- apiGroups: [resource.k8s.io]
+  resources: [resourceclaims]
+  verbs: [get, list, watch]
+{{- end }}
+# Networking
+- apiGroups: [k8s.cni.cncf.io]
+  resources: [network-attachment-definitions]
+  verbs: [get, list]
+- apiGroups: [networking.k8s.io]
+  resources: [ingresses]
+  verbs: [create, get, list, watch, delete]
+# KubeVirt VMs - full CRUD
+- apiGroups: [kubevirt.io]
+  resources: [virtualmachines, virtualmachineinstances]
+  verbs: ["*"]
+- apiGroups: [subresources.kubevirt.io]
+  resources: [virtualmachineinstances/guestosinfo, virtualmachineinstances/filesystemlist, virtualmachineinstances/console, virtualmachineinstances/vnc]
+  verbs: [get]
+- apiGroups: [subresources.kubevirt.io]
+  resources: [virtualmachines/start, virtualmachines/stop, virtualmachines/restart, virtualmachines/addvolume, virtualmachines/removevolume, virtualmachines/migrate, virtualmachines/memorydump, virtualmachines/pause]
+  verbs: [update]
+- apiGroups: [subresources.kubevirt.io]
+  resources: [virtualmachineinstances/pause, virtualmachineinstances/unpause, virtualmachineinstances/addvolume, virtualmachineinstances/removevolume, virtualmachineinstances/freeze, virtualmachineinstances/unfreeze, virtualmachineinstances/softreboot]
+  verbs: [update]
+- apiGroups: [subresources.kubevirt.io]
+  resources: [virtualmachines/expand-spec]
+  verbs: [update]
+# CDI
+- apiGroups: [cdi.kubevirt.io]
+  resources: ["*"]
+  verbs: ["*"]
+# VolumeSnapshots — read golden images for the instant-clone (vm-startup Phase C+D)
+- apiGroups: [snapshot.storage.k8s.io]
+  resources: [volumesnapshots]
+  verbs: [get, list, watch]
+# Autoscaling
+- apiGroups: [autoscaling]
+  resources: [horizontalpodautoscalers]
+  verbs: [create, get, list, watch, delete, update, patch]
+# KDC Clusters - full CRUD
+# Worker inventory is read-only, including for project administrators.
+- apiGroups: [cluster.x-k8s.io]
+  resources: [machines]
+  verbs: [get, list, watch]
+- apiGroups: [cluster.x-k8s.io]
+  resources: [clusters, machinedeployments]
+  verbs: [get, list, watch]
+- apiGroups: [k8s.kube-dc.com]
+  resources: [kdcclusters, kdcclusterdatastores]
+  verbs: [create, get, list, watch, delete, patch, update]
+# Batch
+- apiGroups: [batch]
+  resources: [jobs]
+  verbs: [create, get, list, watch, delete]
+# CronJobs read — see admin role above.
+- apiGroups: [batch]
+  resources: [cronjobs]
+  verbs: [get, list, watch]
+# Kube-DC resources
+- apiGroups: [kube-dc.com]
+  resources: [eips, fips]
+  verbs: [create, get, list, watch, delete]
+# Cert-manager
+- apiGroups: [cert-manager.io]
+  resources: [issuers, certificates]
+  verbs: [create, get, list, watch, delete]
+- apiGroups: [acme.cert-manager.io]
+  resources: [challenges]
+  verbs: [get, list, watch, delete]
+# Policy
+- apiGroups: [policy]
+  resources: [poddisruptionbudgets]
+  verbs: [create, get, list, watch, delete]
+# Discovery
+- apiGroups: [discovery.k8s.io]
+  resources: [endpointslices]
+  verbs: [get, list]
+# Gateway API
+- apiGroups: [gateway.networking.k8s.io]
+  resources: [httproutes, grpcroutes, tlsroutes]
+  verbs: [create, get, list, watch, delete, update, patch]
+- apiGroups: [gateway.envoyproxy.io]
+  resources: [backends]
+  verbs: [get, list, watch]
+# Object Storage (Rook-Ceph S3 buckets)
+- apiGroups: [objectbucket.io]
+  resources: [objectbucketclaims]
+  verbs: [create, get, list, watch, delete]
+# Database Service (db-manager)
+- apiGroups: [db.kube-dc.com]
+  resources: [kdcdatabases]
+  verbs: [create, get, list, watch, delete, patch, update]
+# Managed services (kube-dc-services): the tenant-facing objects, same rights
+# as KdcDatabase. Placements are the hub's; readable so status makes sense.
+- apiGroups: [services.kube-dc.com]
+  resources: [managedservices, serviceoperations, servicebindings, servicecredentialpolicies, replicationgroups]
+  verbs: [create, get, list, watch, delete, patch, update]
+# D1: grants are the Project admin's; other roles read them.
+- apiGroups: [services.kube-dc.com]
+  resources: [servicedataplanegrants, servicedataplanegrants/status]
+  verbs: [get, list, watch]
+- apiGroups: [services.kube-dc.com]
+  resources: [managedservices/status, serviceoperations/status, servicebindings/status, servicecredentialpolicies/status, serviceplacements, serviceplacements/status, servicebackups, servicebackups/status, replicationgroups/status, topologychanges, topologychanges/status]
+  verbs: [get, list, watch]
+# Database Engine Resources (CNPG + MariaDB operator)
+# `clusters` and `mariadbs` reads let the UI surface engine-side recovery
+# progress (status.bootstrap, status.conditions) during a restore.
+- apiGroups: [postgresql.cnpg.io]
+  resources: [backups, scheduledbackups]
+  verbs: [create, get, list, watch, delete]
+- apiGroups: [postgresql.cnpg.io]
+  resources: [clusters]
+  verbs: [get, list, watch]
+- apiGroups: [k8s.mariadb.com]
+  resources: [physicalbackups, backups, databases, users, grants]
+  verbs: [create, get, list, watch, delete]
+- apiGroups: [k8s.mariadb.com]
+  resources: [mariadbs]
+  verbs: [get, list, watch]
+# Velero (Backup & Restore)
+- apiGroups: [velero.io]
+  resources: [backups, restores, schedules, backupstoragelocations]
+  verbs: [create, get, list, watch, delete, update, patch]
+- apiGroups: [velero.io]
+  resources: [backups/status, restores/status]
+  verbs: [get, list, watch]
+# Kube-DC Security Manager — developer gets full CRUD on
+# secrets/certs/DB-creds. KMS is locked down to read-only at the
+# CR plane (per M3 review): create/rotate/min-DV/schedule/cancel
+# are project-manager+ via OpenBao policy + backend SSAR. encrypt
+# and decrypt go through the backend's data-plane endpoints which
+# only need `get kmskeys` (loadKMSKey for the keyName lookup).
+# Hard destroy (?destroy=true on secrets) is gated at the backend;
+# K8s API just sees soft-delete semantics on the CR.
+- apiGroups: [security.kube-dc.com]
+  resources: [managedsecrets, managedcertificates, databasecredentialpolicies]
+  verbs: [create, get, list, watch, update, patch, delete]
+- apiGroups: [security.kube-dc.com]
+  resources: [kmskeys]
+  verbs: [get, list, watch]
+- apiGroups: [security.kube-dc.com]
+  resources: [managedsecrets/status, managedcertificates/status, kmskeys/status, databasecredentialpolicies/status]
+  verbs: [get, list, watch]
+
+---
+# Project Manager Role - Can view all resources, manage some settings (no VM/container CRUD)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: default-project-manager-role
+rules:
+# Core resources - read + limited write
+- apiGroups: [""]
+  resources: [persistentvolumeclaims, services, serviceaccounts, configmaps]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [secrets]
+  verbs: [get, list]
+- apiGroups: [""]
+  resources: [resourcequotas]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [limitranges]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [endpoints]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [pods/log]
+  verbs: [get, list]
+- apiGroups: [""]
+  resources: [events]
+  verbs: [get, list, watch]
+# Metrics (kubectl top pods)
+- apiGroups: [metrics.k8s.io]
+  resources: [pods]
+  verbs: [get, list]
+# Apps - read only
+- apiGroups: [apps]
+  resources: [deployments, daemonsets, replicasets, statefulsets]
+  verbs: [get, list, watch]
+{{- if .Values.gpu.tenantDirectApply }}
+# Shared GPU (DRA) read-only visibility
+- apiGroups: [resource.k8s.io]
+  resources: [resourceclaimtemplates, resourceclaims]
+  verbs: [get, list, watch]
+{{- end }}
+# Networking - read only
+- apiGroups: [k8s.cni.cncf.io]
+  resources: [network-attachment-definitions]
+  verbs: [get, list]
+- apiGroups: [networking.k8s.io]
+  resources: [ingresses]
+  verbs: [get, list, watch]
+# KubeVirt VMs - read + console access
+- apiGroups: [kubevirt.io]
+  resources: [virtualmachines, virtualmachineinstances]
+  verbs: [get, list, watch]
+- apiGroups: [subresources.kubevirt.io]
+  resources: [virtualmachineinstances/guestosinfo, virtualmachineinstances/filesystemlist, virtualmachineinstances/console, virtualmachineinstances/vnc]
+  verbs: [get]
+# CDI - read only
+- apiGroups: [cdi.kubevirt.io]
+  resources: ["*"]
+  verbs: [get, list, watch]
+# VolumeSnapshots — read golden images for the instant-clone (vm-startup Phase C+D)
+- apiGroups: [snapshot.storage.k8s.io]
+  resources: [volumesnapshots]
+  verbs: [get, list, watch]
+# Autoscaling - read only
+- apiGroups: [autoscaling]
+  resources: [horizontalpodautoscalers]
+  verbs: [get, list, watch]
+# Cluster API - read only
+# Worker inventory is read-only, including for project administrators.
+- apiGroups: [cluster.x-k8s.io]
+  resources: [machines]
+  verbs: [get, list, watch]
+- apiGroups: [cluster.x-k8s.io]
+  resources: [clusters, machinedeployments]
+  verbs: [get, list, watch]
+- apiGroups: [controlplane.cluster.x-k8s.io]
+  resources: [kthreescontrolplanes]
+  verbs: [get, list, watch]
+- apiGroups: [infrastructure.cluster.x-k8s.io]
+  resources: [kubevirtmachinetemplates, kubevirtclusters]
+  verbs: [get, list, watch]
+# Batch - read only
+- apiGroups: [batch]
+  resources: [jobs, cronjobs]
+  verbs: [get, list, watch]
+# Kube-DC resources - read only
+- apiGroups: [kube-dc.com]
+  resources: [eips, fips]
+  verbs: [get, list, watch]
+- apiGroups: [k8s.kube-dc.com]
+  resources: [kdcclusters, kdcclusterdatastores]
+  verbs: [get, list, watch]
+# Cert-manager - read only
+- apiGroups: [cert-manager.io]
+  resources: [issuers, certificates]
+  verbs: [get, list, watch]
+- apiGroups: [acme.cert-manager.io]
+  resources: [challenges]
+  verbs: [get, list, watch]
+# Policy - read only
+- apiGroups: [policy]
+  resources: [poddisruptionbudgets]
+  verbs: [get, list, watch]
+# Discovery
+- apiGroups: [discovery.k8s.io]
+  resources: [endpointslices]
+  verbs: [get, list]
+# Gateway API - read only
+- apiGroups: [gateway.networking.k8s.io]
+  resources: [httproutes, grpcroutes, tlsroutes]
+  verbs: [get, list, watch]
+- apiGroups: [gateway.envoyproxy.io]
+  resources: [backends]
+  verbs: [get, list, watch]
+# Object Storage - read only
+- apiGroups: [objectbucket.io]
+  resources: [objectbucketclaims]
+  verbs: [get, list, watch]
+# Database Service - read only
+- apiGroups: [db.kube-dc.com]
+  resources: [kdcdatabases]
+  verbs: [get, list, watch]
+# Managed services (kube-dc-services) - read only
+- apiGroups: [services.kube-dc.com]
+  resources: [replicationgroups, managedservices, managedservices/status, serviceoperations, serviceoperations/status, servicebindings, servicebindings/status, servicecredentialpolicies, servicecredentialpolicies/status, serviceplacements, serviceplacements/status, servicebackups, servicebackups/status, replicationgroups/status, topologychanges, topologychanges/status, servicedataplanegrants, servicedataplanegrants/status]
+  verbs: [get, list, watch]
+# Match legacy credential-policy access: project-manager may pause or adjust
+# an existing schedule, but may not create/delete policy objects.
+- apiGroups: [services.kube-dc.com]
+  resources: [servicecredentialpolicies]
+  verbs: [update, patch]
+# Database Engine Resources - read only
+- apiGroups: [postgresql.cnpg.io]
+  resources: [backups, scheduledbackups, clusters]
+  verbs: [get, list, watch]
+- apiGroups: [k8s.mariadb.com]
+  resources: [physicalbackups, backups, databases, users, grants, mariadbs]
+  verbs: [get, list, watch]
+# Velero - read only
+- apiGroups: [velero.io]
+  resources: [backups, restores, schedules, backupstoragelocations]
+  verbs: [get, list, watch]
+- apiGroups: [velero.io]
+  resources: [backups/status, restores/status]
+  verbs: [get, list, watch]
+# Kube-DC Security Manager — project-manager reads everything and
+# toggles sync configuration on secrets/certs/DB-creds; cannot
+# create new secrets/certs (per dev-scope §6, that's developer-and-
+# above). On KMS the design inverts: kmskeys create + rotate +
+# min-decryption-version are project-manager+ (UX PRD §4.3), so PM
+# gets create + patch on kmskeys. Schedule/cancel-delete are
+# admin-only and gated by a backend SSAR check (M3-T02 review-pass);
+# PM's `patch` capability covers the refresh-annotation patch the
+# backend writes after rotate / min-DV mutations to wake the
+# reconciler for status mirroring.
+- apiGroups: [security.kube-dc.com]
+  resources: [managedsecrets, managedcertificates, databasecredentialpolicies]
+  verbs: [get, list, watch, update, patch]
+- apiGroups: [security.kube-dc.com]
+  resources: [kmskeys]
+  verbs: [get, list, watch, create, update, patch]
+- apiGroups: [security.kube-dc.com]
+  resources: [managedsecrets/status, managedcertificates/status, kmskeys/status, databasecredentialpolicies/status]
+  verbs: [get, list, watch]
+
+---
+# User Role - Read-only access to project resources
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: default-project-user-role
+rules:
+# Core resources - read only (no secrets)
+- apiGroups: [""]
+  resources: [persistentvolumeclaims, services, serviceaccounts, configmaps]
+  verbs: [get, list]
+- apiGroups: [""]
+  resources: [resourcequotas]
+  verbs: [get, list]
+- apiGroups: [""]
+  resources: [limitranges]
+  verbs: [get, list]
+- apiGroups: [""]
+  resources: [endpoints]
+  verbs: [get, list]
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, list]
+- apiGroups: [""]
+  resources: [pods/log]
+  verbs: [get]
+- apiGroups: [""]
+  resources: [events]
+  verbs: [get, list]
+# Metrics (kubectl top pods)
+- apiGroups: [metrics.k8s.io]
+  resources: [pods]
+  verbs: [get, list]
+# Apps - read only
+- apiGroups: [apps]
+  resources: [deployments, daemonsets, replicasets, statefulsets]
+  verbs: [get, list]
+{{- if .Values.gpu.tenantDirectApply }}
+# Shared GPU (DRA) read-only visibility
+- apiGroups: [resource.k8s.io]
+  resources: [resourceclaimtemplates, resourceclaims]
+  verbs: [get, list]
+{{- end }}
+# Networking - read only
+- apiGroups: [k8s.cni.cncf.io]
+  resources: [network-attachment-definitions]
+  verbs: [get, list]
+- apiGroups: [networking.k8s.io]
+  resources: [ingresses]
+  verbs: [get, list]
+# KubeVirt VMs - read only (no console)
+- apiGroups: [kubevirt.io]
+  resources: [virtualmachines, virtualmachineinstances]
+  verbs: [get, list]
+- apiGroups: [subresources.kubevirt.io]
+  resources: [virtualmachineinstances/guestosinfo, virtualmachineinstances/filesystemlist]
+  verbs: [get]
+# CDI - read only
+- apiGroups: [cdi.kubevirt.io]
+  resources: ["*"]
+  verbs: [get, list]
+# VolumeSnapshots — read golden images for the instant-clone (vm-startup Phase C+D)
+- apiGroups: [snapshot.storage.k8s.io]
+  resources: [volumesnapshots]
+  verbs: [get, list]
+# Autoscaling - read only
+- apiGroups: [autoscaling]
+  resources: [horizontalpodautoscalers]
+  verbs: [get, list]
+# Cluster API - read only
+# Worker inventory is read-only, including for project administrators.
+- apiGroups: [cluster.x-k8s.io]
+  resources: [machines]
+  verbs: [get, list, watch]
+- apiGroups: [cluster.x-k8s.io]
+  resources: [clusters, machinedeployments]
+  verbs: [get, list]
+# Batch - read only. cronjobs added in M1-T11 review pass: the
+# /api/secrets/{name}/consumers scanner lists CronJobs alongside
+# the other workload kinds, and the dev-scope §6 matrix puts that
+# endpoint at `user` minimum role — without `cronjobs` list here
+# the scan returned a partial 403 on every user-role call.
+- apiGroups: [batch]
+  resources: [jobs, cronjobs]
+  verbs: [get, list]
+# Kube-DC resources - read only
+- apiGroups: [kube-dc.com]
+  resources: [eips, fips]
+  verbs: [get, list]
+- apiGroups: [k8s.kube-dc.com]
+  resources: [kdcclusters, kdcclusterdatastores]
+  verbs: [get, list]
+# Cert-manager - read only
+- apiGroups: [cert-manager.io]
+  resources: [issuers, certificates]
+  verbs: [get, list]
+- apiGroups: [acme.cert-manager.io]
+  resources: [challenges]
+  verbs: [get, list]
+# Policy - read only
+- apiGroups: [policy]
+  resources: [poddisruptionbudgets]
+  verbs: [get, list]
+# Discovery
+- apiGroups: [discovery.k8s.io]
+  resources: [endpointslices]
+  verbs: [get, list]
+# Gateway API - read only
+- apiGroups: [gateway.networking.k8s.io]
+  resources: [httproutes, grpcroutes, tlsroutes]
+  verbs: [get, list]
+- apiGroups: [gateway.envoyproxy.io]
+  resources: [backends]
+  verbs: [get, list]
+# Object Storage - read only
+- apiGroups: [objectbucket.io]
+  resources: [objectbucketclaims]
+  verbs: [get, list]
+# Database Service - read only
+- apiGroups: [db.kube-dc.com]
+  resources: [kdcdatabases]
+  verbs: [get, list]
+# Service metadata is readable like the legacy database metadata; no values,
+# engine writes, placement mutation or credential operations are granted.
+- apiGroups: [services.kube-dc.com]
+  resources: [replicationgroups, managedservices, managedservices/status, serviceoperations, serviceoperations/status, servicebindings, servicebindings/status, servicecredentialpolicies, servicecredentialpolicies/status, serviceplacements, serviceplacements/status, servicebackups, servicebackups/status, replicationgroups/status, topologychanges, topologychanges/status, servicedataplanegrants, servicedataplanegrants/status]
+  verbs: [get, list, watch]
+# Database Engine Resources - read only
+- apiGroups: [postgresql.cnpg.io]
+  resources: [backups, scheduledbackups, clusters]
+  verbs: [get, list]
+- apiGroups: [k8s.mariadb.com]
+  resources: [physicalbackups, backups, databases, users, grants, mariadbs]
+  verbs: [get, list]
+# Velero - read only
+- apiGroups: [velero.io]
+  resources: [backups, restores, schedules, backupstoragelocations]
+  verbs: [get, list]
+- apiGroups: [velero.io]
+  resources: [backups/status, restores/status]
+  verbs: [get, list]
+# Kube-DC Security Manager (M1+) — user role gets metadata-only reads.
+# Values are gated by OpenBao policy (project-<p>-user only has
+# metadata read, not data), but K8s RBAC still controls whether the
+# user can even see the CR list.
+- apiGroups: [security.kube-dc.com]
+  resources: [managedsecrets, managedcertificates, kmskeys, databasecredentialpolicies]
+  verbs: [get, list, watch]
+- apiGroups: [security.kube-dc.com]
+  resources: [managedsecrets/status, managedcertificates/status, kmskeys/status, databasecredentialpolicies/status]
+  verbs: [get, list, watch]

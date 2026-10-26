@@ -1,0 +1,23 @@
+apiVersion: security.kube-dc.com/v1alpha1
+kind: ManagedCertificate
+metadata:
+  name: "{certificate-name}"
+  namespace: "{backing-namespace}"
+spec:
+  # private: Organization intermediate CA; distribute its trust chain
+  # public: configured ACME issuer; public DNS and challenge must work
+  type: private
+
+  purpose: server # server | client | mtls | code-signing
+
+  # At least one DNS SAN is required and every name must be allowed by
+  # Organization.spec.security.certificateDomains.
+  dnsNames:
+  - "{allowed-dns-name}"
+
+  # IP SANs are reserved in the API but currently rejected by admission.
+  duration: 90d
+  renewBefore: 15d
+
+  # If omitted, admission defaults to {certificate-name}-tls.
+  targetSecretName: "{target-secret-name}"

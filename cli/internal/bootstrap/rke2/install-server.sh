@@ -1,0 +1,1141 @@
+#!/bin/bash
+#
+# RKE2 Server Installation Script
+# Installs first control-plane node or joins as additional server
+#
+# Usage:
+#   First server:  ./install-server.sh
+#   Join server:   ./install-server.sh <token> <server-ip>
+#
+# Environment variables (optional):
+#   RKE2_VERSION     - RKE2 version (default: v1.36.3+rke2r1)
+#   NODE_NAME        - Node name (default: hostname)
+#   NODE_IP          - Node IP for K8s internal traffic (default: detected)
+#   EXTERNAL_IP      - External IP for ingress (default: NODE_IP)
+#   DOMAIN           - Cluster base domain (default: kube-dc.cloud). Pass the
+#                       same value that ends up in clusters/<name>/cluster-
+#                       config.env's DOMAIN= line. tls-san is generated as
+#                         [${DOMAIN}, kube-api.${DOMAIN}, ${EXTERNAL_IP},
+#                          ${NODE_IP}, …]
+#                       so both the bare domain (matches the wildcard cert
+#                       for *.${DOMAIN}) AND the kube-api subdomain (used by
+#                       every downstream consumer: KUBE_API_EXTERNAL_URL,
+#                       kube-dc-manager values, platform's kube-api TLSRoute,
+#                       internal CoreDNS overrides) validate against the
+#                       apiserver cert. See docs/prd/installer-bugs-real-
+#                       install.md §D'''''.9.
+#                       (CLUSTER_DOMAIN is honored as a fallback for
+#                       transitional installs; it should be the full
+#                       kube-api.<domain> form. New callers prefer DOMAIN.)
+#   POD_CIDR         - Pod network CIDR (default: 10.100.0.0/16)
+#   SERVICE_CIDR     - Service network CIDR (default: 10.101.0.0/16)
+#   CLUSTER_DNS      - Cluster DNS IP (default: 10.101.0.11)
+#   CP_PORT          - Supervisor port of the server being joined
+#                       (join mode only; default: 9345)
+#
+
+set -euo pipefail
+
+# The guided engine stages immutable installer and archive bytes in a root-owned
+# directory. Verify them before config, resolver, sysctl, trust or service writes.
+if [[ -n "${KDC_RKE2_INSTALLER:-}" ]]; then
+    [[ "${KDC_RKE2_INSTALLER}" =~ ^/var/lib/kube-dc-rke2\.[A-Za-z0-9]+/install\.sh$ ]]
+    [[ "${KDC_RKE2_INSTALLER_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]
+    [[ "${INSTALL_RKE2_ARTIFACT_PATH:-}" == "${KDC_RKE2_INSTALLER%/install.sh}" ]]
+    printf '%s  %s\n' "${KDC_RKE2_INSTALLER_SHA256}" "${KDC_RKE2_INSTALLER}" | sha256sum --check --status
+    case "$(uname -m)" in x86_64) KDC_ARCH=amd64;; aarch64) KDC_ARCH=arm64;; *) exit 1;; esac
+    (cd "${INSTALL_RKE2_ARTIFACT_PATH}" && sha256sum --check --status "sha256sum-${KDC_ARCH}.txt")
+    [[ "${RKE2_DNS_PUBLIC_FALLBACK:-false}" != true ]]
+    export INSTALL_RKE2_METHOD=tar
+fi
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log_info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+
+# Default configuration
+RKE2_VERSION="${RKE2_VERSION:-v1.36.3+rke2r1}"
+NODE_NAME="${NODE_NAME:-$(hostname)}"
+NODE_IP="${NODE_IP:-$(hostname -I | awk '{print $1}')}"
+EXTERNAL_IP="${EXTERNAL_IP:-${NODE_IP}}"
+
+# Cluster base domain — single source of truth, matches
+# clusters/<name>/cluster-config.env's DOMAIN= line. The full
+# kube-api.${DOMAIN} hostname is synthesized below and added to
+# tls-san so the apiserver cert validates against both forms.
+DOMAIN="${DOMAIN:-}"
+if [[ -z "${DOMAIN}" ]]; then
+    # Back-compat: legacy callers set CLUSTER_DOMAIN to the full
+    # kube-api.<domain> form. Strip the optional kube-api. prefix
+    # to recover the bare domain. New callers should pass DOMAIN
+    # directly to avoid this fixup.
+    DOMAIN="${CLUSTER_DOMAIN:-kube-dc.cloud}"
+    DOMAIN="${DOMAIN#kube-api.}"
+fi
+API_HOSTNAME="kube-api.${DOMAIN}"
+
+POD_CIDR="${POD_CIDR:-10.100.0.0/16}"
+SERVICE_CIDR="${SERVICE_CIDR:-10.101.0.0/16}"
+CLUSTER_DNS="${CLUSTER_DNS:-10.101.0.11}"
+
+# Join parameters (optional)
+JOIN_TOKEN="${1:-}"
+JOIN_SERVER="${2:-}"
+CP_PORT="${CP_PORT:-9345}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RANCHER_DIR="/etc/rancher/rke2"
+
+log_info "=== RKE2 Server Installation ==="
+log_info "Version:      ${RKE2_VERSION}"
+log_info "Node Name:    ${NODE_NAME}"
+log_info "Node IP:      ${NODE_IP}"
+log_info "External IP:  ${EXTERNAL_IP}"
+log_info "Domain:       ${DOMAIN}"
+log_info "API hostname: ${API_HOSTNAME}"
+
+# Check if running as root
+if [[ $EUID -ne 0 ]]; then
+    log_error "This script must be run as root"
+    exit 1
+fi
+
+# Ensure DNS resolution works.
+#
+# Probed with `getent hosts`, which is glibc and therefore always present. This
+# used to run `host get.rke2.io` — a binary from bind9-host/dnsutils that minimal
+# Ubuntu cloud images do NOT ship. On such a host the probe failed with
+# "command not found", which was read as "DNS is broken", and the fallback below
+# then disabled systemd-resolved and replaced /etc/resolv.conf with public
+# resolvers. On a corporate network that breaks every internal name AND sends
+# every subsequent query to a third party — from a node whose DNS was fine.
+if [[ -z "${KDC_RKE2_INSTALLER:-}" ]] && ! getent hosts get.rke2.io >/dev/null 2>&1; then
+    # DEFAULT: do NOT touch the resolver. On a corporate or air-gapped network,
+    # silently replacing /etc/resolv.conf with public DNS breaks every internal
+    # name and leaks queries to a third party — from a node whose DNS was a
+    # deliberate choice. Fail clearly and let the operator fix DNS (or use an
+    # RKE2 mirror / local artifact). The public-DNS rewrite is OPT-IN only.
+    if [[ "${RKE2_DNS_PUBLIC_FALLBACK:-false}" != "true" ]]; then
+        log_error "Cannot resolve get.rke2.io from this node."
+        log_error "kube-dc does not rewrite this node's resolver by default. Fix DNS so"
+        log_error "this node can resolve get.rke2.io (point it at a resolver with egress,"
+        log_error "or configure an RKE2 mirror / local artifact), then re-run. The platform"
+        log_error "later needs to resolve your OWN domain from here, so a working resolver"
+        log_error "matters beyond the install."
+        log_error "To force a public-DNS fallback (8.8.8.8/1.1.1.1) anyway, re-run with"
+        log_error "RKE2_DNS_PUBLIC_FALLBACK=true — do NOT do this on a corporate/air-gapped host."
+        exit 1
+    fi
+    log_warn "RKE2_DNS_PUBLIC_FALLBACK=true — replacing this node's resolver with public DNS."
+    log_warn "This REPLACES /etc/resolv.conf. If this node is supposed to use an internal"
+    log_warn "DNS server, stop and fix DNS instead."
+    # Preserve whatever was there so the change is reversible.
+    if [[ -e /etc/resolv.conf && ! -e /etc/resolv.conf.pre-kube-dc ]]; then
+        cp -a /etc/resolv.conf /etc/resolv.conf.pre-kube-dc 2>/dev/null || true
+        log_warn "Previous resolver saved to /etc/resolv.conf.pre-kube-dc"
+    fi
+    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+        log_warn "Disabling systemd-resolved..."
+        systemctl stop systemd-resolved
+        systemctl disable systemd-resolved
+        rm -f /etc/resolv.conf
+    fi
+    echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/resolv.conf
+    if ! getent hosts get.rke2.io >/dev/null 2>&1; then
+        log_error "Still cannot resolve get.rke2.io after the DNS fallback."
+        log_error "This node has no working DNS or no egress. Fix that first —"
+        log_error "every later phase (image pulls, ACME, your own domain) needs it."
+        exit 1
+    fi
+fi
+
+# Create config directory
+mkdir -p "${RANCHER_DIR}"
+mkdir -p /etc/rancher
+
+# Kernel sysctls — bumped from defaults to handle kube-dc workload
+# density (kubevirt VMs + dense controller fleet). The default
+# fs.inotify.max_user_instances=128 is far too low: virt-handler
+# (kubevirt) crashes with "Failed to create an inotify watcher:
+# too many open files" once a few controllers grab their fair
+# share. Other limits sized for high-pod-density workloads.
+#
+# Persistent on disk so the values survive reboot. The fleet ALSO
+# ships a node-tuning DaemonSet (infrastructure/node-tuning/) that
+# applies the same sysctls at runtime — bootstrap node-tuning is
+# defense-in-depth, useful for clusters where the operator skips
+# the DaemonSet for whatever reason.
+log_info "Writing /etc/sysctl.d/99-kube-dc.conf and reloading kernel..."
+cat > /etc/sysctl.d/99-kube-dc.conf <<'SYSCTL_EOF'
+# Managed by kube-dc rke2 install scripts. See
+# bootstrap/rke2/install-server.sh and install-agent.sh.
+fs.inotify.max_user_instances = 8192
+fs.inotify.max_user_watches = 524288
+kernel.pid_max = 4194304
+net.core.somaxconn = 32768
+net.core.netdev_max_backlog = 16384
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_max_syn_backlog = 8192
+vm.max_map_count = 262144
+SYSCTL_EOF
+# Apply ONLY our file — never `sysctl --system`. --system reloads every
+# sysctl.d file on the host, so a PRE-EXISTING malformed entry in a
+# base-image/operator tuning file (field incident 2026-07-23: a worker
+# carried a broken net.ipv4.tcp_rmem/tcp_wmem tuple; EINVAL made sysctl
+# exit 1 and set -e killed the whole join) fails an install for values
+# that are none of our business. Our values still apply strictly — a
+# failure HERE is a real error. Runtime state is owned by the fleet's
+# node-tuning DaemonSet anyway.
+sysctl -p /etc/sysctl.d/99-kube-dc.conf >/dev/null
+
+# OIDC authn was driven by /etc/rancher/auth-conf.yaml until kube-dc v0.3.0
+# (commit shalb/kube-dc 7877184). We now use the gardener
+# oidc-webhook-authenticator deployed as part of infra-core; the kubeconfig
+# at /etc/rancher/oidc-webhook-kubeconfig.yaml is written on each CP node by
+# the webhook DaemonSet's init container. Bootstrap therefore writes NO
+# authn-config flag — RKE2 starts with cert-only authn until Flux finishes
+# infra-core. `kube-dc bootstrap init` then adds
+# --authentication-token-webhook-config-file to kube-apiserver-arg on every
+# CP node as its last finalize step; `kube-dc bootstrap oidc-cutover` does the
+# same thing on demand. Runbook: docs/internal/oidc-webhook-cloud-rollout.md.
+
+# Compute kubelet memory reservations sized to actual node memory.
+# Tiers are calibrated to keep system+kube+eviction at ≈10–15% of total
+# memory, leaving the bulk for tenant workloads while still protecting
+# kubelet/containerd/etcd from kernel OOM (the 2026-05-06 cloud incident
+# postmortem motivates this — without reservations, sudden memory
+# pressure OOM-killed something in etcd's reconcile path on a 125 GiB
+# node, took 4h to recover).
+#
+# Sizes chosen so the tightest tier (16 GiB) still leaves ~13 GiB for
+# pods (≈ 80% allocatable), and the largest tier reserves a flat 4 GiB
+# each above 64 GiB (no point reserving more on a 256 GiB box).
+MEM_TOTAL_GIB=$(awk '/^MemTotal:/ {printf "%d", $2/1048576}' /proc/meminfo)
+if [ "${MEM_TOTAL_GIB:-0}" -ge 64 ]; then
+    KUBELET_RESERVED_TIER="large (≥64 GiB)"
+    KUBELET_SYS_RESERVED="cpu=500m,memory=4Gi"
+    KUBELET_KUBE_RESERVED="cpu=500m,memory=4Gi"
+    KUBELET_EVICTION_HARD="memory.available<2Gi,nodefs.available<10%"
+    KUBELET_MAX_PODS="250"
+elif [ "${MEM_TOTAL_GIB:-0}" -ge 32 ]; then
+    KUBELET_RESERVED_TIER="medium (32–64 GiB)"
+    KUBELET_SYS_RESERVED="cpu=300m,memory=2Gi"
+    KUBELET_KUBE_RESERVED="cpu=300m,memory=2Gi"
+    KUBELET_EVICTION_HARD="memory.available<1Gi,nodefs.available<10%"
+    KUBELET_MAX_PODS="220"
+else
+    KUBELET_RESERVED_TIER="small (<32 GiB)"
+    KUBELET_SYS_RESERVED="cpu=200m,memory=1Gi"
+    KUBELET_KUBE_RESERVED="cpu=200m,memory=1Gi"
+    KUBELET_EVICTION_HARD="memory.available<500Mi,nodefs.available<10%"
+    KUBELET_MAX_PODS="200"
+fi
+# max-pods upstream default is 110, sized for ~2 GiB/pod budget. On large
+# nodes that's the bottleneck before memory — a 125 GiB CP hit 110 pods
+# on 2026-05-06 with multus + rgw stuck Pending. kube-dc is pod-dense: an
+# all-in-one / single-node install runs the WHOLE platform on one node and
+# exceeds 110 during reconcile ("Too many pods", E2E finding 12 — 200
+# worked). So the floor is 200 even on the smallest tier; bigger nodes get
+# more headroom (220 / 250).
+log_info "Node memory: ${MEM_TOTAL_GIB} GiB → kubelet tier: ${KUBELET_RESERVED_TIER}"
+log_info "  system-reserved=${KUBELET_SYS_RESERVED}"
+log_info "  kube-reserved=${KUBELET_KUBE_RESERVED}"
+log_info "  eviction-hard=${KUBELET_EVICTION_HARD}"
+log_info "  max-pods=${KUBELET_MAX_PODS}"
+
+# --- Control-plane CPU shares ------------------------------------------------
+# etcd and kube-apiserver run as STATIC PODS inside the kubepods cgroup, so
+# system-reserved / kube-reserved -- which carve capacity OUTSIDE kubepods --
+# do not shield them from tenant pods. Under contention the kernel divides CPU
+# by cpu.shares, proportional to each pod's CPU *request*, and RKE2's defaults
+# (etcd 200m, kube-apiserver 250m) pin the whole control plane to a ~0.45-core
+# floor however large the node is.
+#
+# Not hypothetical: on 2026-09-07 a cloud control-plane node carrying tenant
+# VMs at 93% CPU pushed etcd into "apply request took too long" (262ms against
+# a 100ms expectation) while three sibling nodes sat at 7-31%. Reservations
+# alone could not have prevented it -- they do not apply to static pods.
+#
+# Tiered on CPU COUNT (not memory, unlike the kubelet tier above): the floor
+# only has to stay meaningful under contention while remaining a small
+# fraction of allocatable. Small nodes keep RKE2's defaults -- an all-in-one
+# install cannot afford to hand whole cores to the control plane.
+CPU_TOTAL=$(nproc 2>/dev/null || echo 1)
+if [ "${CPU_TOTAL:-1}" -ge 32 ]; then
+    CP_RESERVED_TIER="large (>=32 cpu)"
+    CP_ETCD_CPU="2000m"; CP_APISERVER_CPU="2000m"
+elif [ "${CPU_TOTAL:-1}" -ge 16 ]; then
+    CP_RESERVED_TIER="medium (16-32 cpu)"
+    CP_ETCD_CPU="1000m"; CP_APISERVER_CPU="1000m"
+elif [ "${CPU_TOTAL:-1}" -ge 8 ]; then
+    CP_RESERVED_TIER="modest (8-16 cpu)"
+    CP_ETCD_CPU="500m"; CP_APISERVER_CPU="500m"
+else
+    CP_RESERVED_TIER="small (<8 cpu, RKE2 defaults)"
+    CP_ETCD_CPU="200m"; CP_APISERVER_CPU="250m"
+fi
+
+# Raising a static pod's request SHRINKS the node's allocatable. On a fresh
+# install nothing is scheduled yet, so that costs nothing. On a node that
+# ALREADY has an RKE2 config the node may be packed, and shrinking allocatable
+# can leave newly scheduled pods Pending.
+#
+# Existence is judged by config.yaml, NOT by whether rke2-server is currently
+# active: a stopped or failed service on an established node would otherwise be
+# misread as fresh and get an unpreflighted raise. This matches how the
+# kube-apiserver-arg block below decides the same question.
+#
+# An existing control-plane-resource-requests line is PRESERVED verbatim. This
+# script regenerates config.yaml from scratch, so without this a re-install of a
+# node installed WITH a raise would silently rewrite it back down to RKE2's
+# defaults and quietly remove the protection on restart. Both YAML spellings are
+# captured -- a flow sequence on the key line, and a block sequence of indented
+# "- " items, which RKE2 accepts equally and an operator may well have written.
+#
+# CP_RESOURCE_RAISE=force wins over preservation, so a resized node pinned to a
+# now-too-small value can still be raised deliberately; the capture is skipped
+# entirely in that case.
+CP_RESOURCE_REQUESTS_OVERRIDE=""
+PRESERVED_CP_REQUESTS=""
+if [[ -f "${RANCHER_DIR}/config.yaml" && "${CP_RESOURCE_RAISE:-}" != "force" ]]; then
+    PRESERVED_CP_REQUESTS="$(awk '
+        # Flow style: key and a non-empty value on the same line.
+        /^control-plane-resource-requests:[[:space:]]*[^[:space:]]/ {
+            sub(/^control-plane-resource-requests:[[:space:]]*/, "")
+            print; exit
+        }
+        # Block style: bare key, then indented "- " sequence items.
+        /^control-plane-resource-requests:[[:space:]]*$/ { inblock=1; next }
+        inblock {
+            if ($0 ~ /^[[:space:]]*-[[:space:]]/) {
+                item = $0
+                sub(/^[[:space:]]*-[[:space:]]*/, "", item)
+                buf = (buf == "" ? item : buf ", " item)
+                next
+            }
+            if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) { next }
+            inblock = 0
+        }
+        END { if (buf != "") print "[" buf "]" }
+    ' "${RANCHER_DIR}/config.yaml")"
+fi
+
+if [[ -n "${PRESERVED_CP_REQUESTS}" ]]; then
+    log_info "Preserving existing control-plane-resource-requests across re-install"
+    CP_RESERVED_TIER="preserved from existing config"
+    CP_RESOURCE_REQUESTS_OVERRIDE="${PRESERVED_CP_REQUESTS}"
+elif [[ -f "${RANCHER_DIR}/config.yaml" && "${CP_RESOURCE_RAISE:-}" != "force" ]]; then
+    log_warn "existing RKE2 config found -- keeping RKE2 default control-plane CPU requests"
+    log_warn "  a raise shrinks allocatable on a node that already carries pods;"
+    log_warn "  re-run with CP_RESOURCE_RAISE=force once the node has headroom"
+    CP_RESERVED_TIER="existing node -- defaults kept"
+    CP_ETCD_CPU="200m"; CP_APISERVER_CPU="250m"
+fi
+
+# The FULL set is emitted, not only the raised values: this flag REPLACES
+# RKE2's built-in request list rather than merging into it, so naming just
+# etcd-cpu/kube-apiserver-cpu would silently drop every memory request and
+# every other component's request -- leaving kube-scheduler,
+# kube-controller-manager and kube-proxy BestEffort and first to be evicted.
+# The trailing values are RKE2 v1.36's own defaults, verified against a live
+# cluster; only the etcd/kube-apiserver CPU figures above are raised. Emitting
+# the defaults explicitly is also correct if the flag ever merges -- a no-op.
+CP_RESOURCE_REQUESTS="[etcd-cpu=${CP_ETCD_CPU}, etcd-memory=512Mi,\
+ kube-apiserver-cpu=${CP_APISERVER_CPU}, kube-apiserver-memory=1Gi,\
+ kube-controller-manager-cpu=200m, kube-controller-manager-memory=256Mi,\
+ kube-scheduler-cpu=100m, kube-scheduler-memory=128Mi,\
+ kube-proxy-cpu=250m, kube-proxy-memory=128Mi]"
+# A preserved line wins over anything computed above.
+if [[ -n "${CP_RESOURCE_REQUESTS_OVERRIDE:-}" ]]; then
+    CP_RESOURCE_REQUESTS="${CP_RESOURCE_REQUESTS_OVERRIDE}"
+fi
+log_info "Node CPU: ${CPU_TOTAL} cores -> control-plane tier: ${CP_RESERVED_TIER}"
+log_info "  control-plane-resource-requests=${CP_RESOURCE_REQUESTS}"
+
+
+# --- Private-CA trust for the NODE (docs/prd/platform-trust-bundle.md) ---
+#
+# The platform distributes its CA into ConfigMaps so PODS can verify internal
+# endpoints. That does nothing for this host: containerd, kubelet and rke2 read
+# the OS trust store. On an air-gapped install the registry is internal and
+# served by the org's own CA, so without this the FIRST image pull fails —
+# before any pod exists, and therefore before pod-layer trust could help.
+#
+# Runs before rke2 starts, deliberately. TRUSTED_CA_FILE empty = public CAs
+# only, which is correct for an ACME/internet-connected cluster.
+install_node_trusted_ca() {
+    local src="${1}"
+
+    # Resolve the distro anchor directory up front: it is needed both to install
+    # and to report what a node already trusts when no bundle was supplied.
+    local anchor_dir suffix
+    local -a update_cmd
+    if [[ -d /usr/local/share/ca-certificates ]]; then
+        # Debian/Ubuntu. The .crt extension is REQUIRED: update-ca-certificates
+        # ignores any other suffix, so a .pem lands in the directory, reports
+        # success, and is never trusted.
+        anchor_dir=/usr/local/share/ca-certificates
+        suffix=crt
+        update_cmd=(update-ca-certificates)
+    elif [[ -d /etc/pki/ca-trust/source/anchors ]]; then
+        anchor_dir=/etc/pki/ca-trust/source/anchors
+        suffix=pem
+        update_cmd=(update-ca-trust extract)
+    else
+        anchor_dir=""
+        suffix=""
+        update_cmd=()
+    fi
+
+    if [[ -z "${src}" ]]; then
+        # No bundle requested. Anchors from an EARLIER install are deliberately
+        # left in place — silently untrusting a CA could cut a running node off
+        # from its registry. But staying silent would let a re-run advertised as
+        # "public CAs only" leave a private CA trusted with no mention of it, so
+        # say what this host actually trusts.
+        if [[ -n "${anchor_dir}" ]] && compgen -G "${anchor_dir}/kube-dc-platform-ca-*.${suffix}" >/dev/null 2>&1; then
+            log_warn "No CA bundle was supplied, but this node STILL TRUSTS a kube-dc CA from an earlier install:"
+            local existing
+            for existing in "${anchor_dir}"/kube-dc-platform-ca-*."${suffix}"; do
+                log_warn "  ${existing} — $(openssl x509 -in "${existing}" -noout -subject 2>/dev/null || echo unreadable)"
+            done
+            log_warn "To stop trusting it: remove those files and run ${update_cmd[0]}."
+        fi
+        return 0
+    fi
+
+    if [[ ! -s "${src}" ]]; then
+        log_error "TRUSTED_CA_FILE=${src} is missing or empty"
+        return 1
+    fi
+    if ! grep -q "BEGIN CERTIFICATE" "${src}"; then
+        log_error "TRUSTED_CA_FILE=${src} contains no PEM certificate"
+        return 1
+    fi
+    # Refuse to install anything carrying a private key onto a fleet of hosts.
+    if grep -qE "BEGIN (RSA |EC |DSA |OPENSSH |ENCRYPTED |)PRIVATE KEY" "${src}"; then
+        log_error "TRUSTED_CA_FILE=${src} contains a PRIVATE KEY — refusing to install it as a node trust anchor"
+        return 1
+    fi
+
+    # Bind what we install to what the CLI validated.
+    #
+    # The Go side parses the bundle properly (certificates only, CA only, size
+    # bounded); this script only looks for PEM markers. Between the two, the file
+    # sits at a predictable path that any local user can reach, so without this
+    # the weaker parser decides what becomes a fleet-wide trust anchor. The CLI
+    # passes the SHA-256 it validated; a mismatch means the bytes changed after
+    # validation and is fatal, never a warning.
+    local actual_fp
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual_fp="$(sha256sum < "${src}" | cut -d' ' -f1)"
+    elif command -v openssl >/dev/null 2>&1; then
+        actual_fp="$(openssl dgst -sha256 "${src}" | awk '{print $NF}')"
+    fi
+    if [[ -n "${TRUSTED_CA_SHA256:-}" ]]; then
+        if [[ -z "${actual_fp}" ]]; then
+            log_error "Cannot hash ${src} (no sha256sum or openssl); refusing to install an unverified trust anchor"
+            return 1
+        fi
+        if [[ "${actual_fp}" != "${TRUSTED_CA_SHA256}" ]]; then
+            log_error "TRUSTED_CA_FILE=${src} does NOT match the bundle the installer validated"
+            log_error "  expected sha256 ${TRUSTED_CA_SHA256}"
+            log_error "  found    sha256 ${actual_fp}"
+            log_error "The staged file changed between validation and install; refusing to trust it."
+            return 1
+        fi
+    fi
+
+    if [[ -z "${anchor_dir}" ]]; then
+        log_error "No CA anchor directory found (looked for /usr/local/share/ca-certificates and /etc/pki/ca-trust/source/anchors)"
+        log_error "This host's distribution is not supported for automatic node trust; install the CA manually before re-running."
+        return 1
+    fi
+    if ! command -v "${update_cmd[0]}" >/dev/null 2>&1; then
+        log_error "${update_cmd[0]} not found; cannot refresh the node trust store"
+        return 1
+    fi
+    if ! command -v openssl >/dev/null 2>&1; then
+        # Without openssl nothing can confirm the CA became usable, and an
+        # unverifiable air-gapped install fails at the first image pull instead.
+        log_error "openssl not found; cannot verify that the node trust store accepted the CA"
+        return 1
+    fi
+
+    # ONE CERTIFICATE PER FILE.
+    #
+    # Debian's update-ca-certificates only creates CApath hash symlinks for
+    # single-certificate files — measured on debian:12: two certs in one .crt
+    # produced ZERO new links, the same two certs in two files produced two. The
+    # multi-cert file still reaches ca-certificates.crt, so CAfile consumers (Go,
+    # and therefore containerd) are fine, but anything using SSL_CERT_DIR alone
+    # silently would not trust it.
+    local work total i
+    work="$(mktemp -d)"
+    awk -v dir="${work}" '
+        /BEGIN CERTIFICATE/ { n++ }
+        n > 0 { print > (dir "/cert-" n ".pem") }
+    ' "${src}"
+    total="$(find "${work}" -name 'cert-*.pem' | wc -l)"
+    if [[ "${total}" -eq 0 ]]; then
+        rm -rf "${work}"
+        log_error "No certificates could be extracted from ${src}"
+        return 1
+    fi
+
+    # Keep the previous anchors so a failed update can be rolled back rather than
+    # leaving the node with neither the old nor the new trust configuration.
+    local backup
+    backup="$(mktemp -d)"
+    if compgen -G "${anchor_dir}/kube-dc-platform-ca-*.${suffix}" >/dev/null 2>&1; then
+        cp -a "${anchor_dir}"/kube-dc-platform-ca-*."${suffix}" "${backup}/" 2>/dev/null || true
+    fi
+
+    local changed=0 dest
+    for (( i = 1; i <= total; i++ )); do
+        dest="${anchor_dir}/kube-dc-platform-ca-${i}.${suffix}"
+        if [[ -f "${dest}" ]] && [[ "$(sha256sum < "${work}/cert-${i}.pem" | cut -d' ' -f1)" == "$(sha256sum < "${dest}" | cut -d' ' -f1)" ]]; then
+            continue
+        fi
+        if ! install -m 0644 "${work}/cert-${i}.pem" "${dest}"; then
+            # errexit does not apply here: the function runs inside `if !`, which
+            # disables it for everything it calls, so an unchecked failure would
+            # sail on to the updater and report success.
+            log_error "Failed to install ${dest}"
+            rm -rf "${work}" "${backup}"
+            return 1
+        fi
+        changed=1
+    done
+    # Remove anchors left by a LARGER previous bundle, or they stay trusted for ever.
+    local stale n
+    for stale in "${anchor_dir}"/kube-dc-platform-ca-*."${suffix}"; do
+        [[ -e "${stale}" ]] || continue
+        n="${stale##*kube-dc-platform-ca-}"
+        n="${n%%.*}"
+        if [[ "${n}" =~ ^[0-9]+$ ]] && (( n > total )); then
+            rm -f "${stale}"
+            changed=1
+        fi
+    done
+    rm -rf "${work}"
+
+    if (( changed )); then
+        if ! "${update_cmd[@]}" >/dev/null 2>&1; then
+            log_error "${update_cmd[0]} failed; rolling back to the previous anchors"
+            rm -f "${anchor_dir}"/kube-dc-platform-ca-*."${suffix}"
+            if compgen -G "${backup}/kube-dc-platform-ca-*.${suffix}" >/dev/null 2>&1; then
+                cp -a "${backup}"/kube-dc-platform-ca-*."${suffix}" "${anchor_dir}/" 2>/dev/null || true
+                "${update_cmd[@]}" >/dev/null 2>&1 || true
+            fi
+            rm -rf "${backup}"
+            return 1
+        fi
+    fi
+    rm -rf "${backup}"
+
+    # Prove it landed rather than trusting the exit code. update-ca-certificates
+    # exits 0 while silently SKIPPING any file it does not like — most notably one
+    # whose name does not end .crt — so a "successful" run can leave the CA
+    # completely untrusted. Measured on debian:12: the .pem case exits 0 and the
+    # CA is absent from the bundle.
+    #
+    # Verified even when nothing changed: a previous run could have written the
+    # anchor and then failed to rebuild the store, and byte-equality alone would
+    # call that success for ever afterwards.
+    #
+    # -no_check_time because an EXPIRED root is legitimate here: a rotation bundle
+    # carries the outgoing CA alongside the incoming one, and that overlap is what
+    # makes rotation safe. Measured: without it, `openssl verify` rejects the
+    # expired anchor and this function would abort an install that is entirely
+    # correct. -partial_chain so an intermediate-only bundle verifies against the
+    # installed intermediate rather than demanding a root we were never given.
+    local bundle probe rc=1
+    for bundle in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+        [[ -f "${bundle}" ]] || continue
+        rc=0
+        # EVERY certificate is probed. Checking only the first would report
+        # success whenever that one happened to be trusted already, while the
+        # anchors that actually matter were skipped.
+        for (( i = 1; i <= total; i++ )); do
+            probe="${anchor_dir}/kube-dc-platform-ca-${i}.${suffix}"
+            if ! openssl verify -no_check_time -partial_chain -CAfile "${bundle}" "${probe}" >/dev/null 2>&1; then
+                log_error "${update_cmd[0]} reported success but the CA is NOT trusted via ${bundle}"
+                log_error "  not trusted: $(openssl x509 -in "${probe}" -noout -subject 2>/dev/null || echo "${probe}")"
+                log_error "On Debian/Ubuntu the anchor MUST end in .crt or update-ca-certificates ignores it silently."
+                rc=1
+                break
+            fi
+        done
+        break
+    done
+    if (( rc != 0 )); then
+        return 1
+    fi
+    log_info "Node trust store updated and verified (${total} CA certificate(s) in ${anchor_dir})"
+    return 0
+}
+
+if ! install_node_trusted_ca "${TRUSTED_CA_FILE:-}"; then
+    # Remove the staged copy even on failure: it is at a predictable path in a
+    # world-writable directory, and leaving it behind is a collision target for
+    # the next run.
+    [[ -n "${TRUSTED_CA_FILE:-}" ]] && rm -f "${TRUSTED_CA_FILE}"
+    log_error "Node trust setup failed; refusing to continue."
+    log_error "An air-gapped install WILL fail at the first image pull without it."
+    exit 1
+fi
+[[ -n "${TRUSTED_CA_FILE:-}" ]] && rm -f "${TRUSTED_CA_FILE}"
+
+# --- Embedded registry mirror (spegel) — vm-startup-acceleration Phase A ---
+# Every node serves/pulls image content P2P from its containerd store (RKE2
+# embedded spegel, GA >= v1.31.4). Requires TCP 5001 + 9345 between nodes.
+# EMBEDDED_REGISTRY=false opts out; REGISTRY_MIRROR_SCOPE narrows the mirror
+# list (default "*" = all registries). registries.yaml is ALWAYS written when
+# enabled: embedded-registry with no mirrors entry hangs rke2 startup on some
+# versions (rancher/rke2#9755).
+# The "*" default is deliberate despite RKE2's equal-trust warning: every node
+# this script installs is a platform-owned MANAGEMENT-cluster node (masters +
+# storage workers of one kube-dc install). Tenant workloads run inside VMs and
+# nested clusters, never on these hosts, so the nodes already share full trust.
+# Narrow REGISTRY_MIRROR_SCOPE only for topologies that break that assumption.
+EMBEDDED_REGISTRY="${EMBEDDED_REGISTRY:-true}"
+REGISTRY_MIRROR_SCOPE="${REGISTRY_MIRROR_SCOPE:-*}"
+# Return success only when registries.yaml contains at least one mirror key.
+# Enabling embedded-registry against a configs-only/empty mirrors file hangs
+# affected RKE2 versions, so preserve operator files but fail closed.
+registries_has_mirror() {
+    awk '
+        BEGIN { in_mirrors = 0; found = 0 }
+        /^mirrors:[[:space:]]*/ {
+            in_mirrors = 1
+            rest = $0
+            sub(/^mirrors:[[:space:]]*/, "", rest)
+            sub(/[[:space:]]+#.*/, "", rest)
+            sub(/^#.*/, "", rest)
+            if (rest != "" && rest != "{}") found = 1
+            next
+        }
+        in_mirrors && /^[^[:space:]#]/ { in_mirrors = 0 }
+        in_mirrors && /^[[:space:]]+[^[:space:]#][^:]*:[[:space:]]*/ { found = 1 }
+        END { exit(found ? 0 : 1) }
+    ' "$1"
+}
+
+EMBEDDED_REGISTRY_BLOCK=""
+if [[ "${EMBEDDED_REGISTRY}" == "true" ]]; then
+    EMBEDDED_REGISTRY_BLOCK=$'embedded-registry: true\nsupervisor-metrics: true'
+    if [[ -f "${RANCHER_DIR}/registries.yaml" ]]; then
+        if ! registries_has_mirror "${RANCHER_DIR}/registries.yaml"; then
+            log_error "Refusing to enable the embedded registry: existing ${RANCHER_DIR}/registries.yaml has no mirror entries."
+            log_error "Add a non-empty mirrors: mapping, or rerun kube-dc bootstrap install with --embedded-registry=false."
+            exit 1
+        fi
+        # Never truncate an operator-managed registries.yaml (private
+        # mirrors/credentials/TLS live here). The embedded registry works
+        # with whatever mirrors it already defines.
+        log_warn "registries.yaml already exists — keeping it (not overwriting with the default mirror entry)"
+    else
+        cat > "${RANCHER_DIR}/registries.yaml" <<EOF
+mirrors:
+  "${REGISTRY_MIRROR_SCOPE}":
+EOF
+    fi
+    log_info "Embedded registry mirror enabled (mirror scope: ${REGISTRY_MIRROR_SCOPE})"
+fi
+
+# PRESERVE an operator-owned kube-apiserver-arg block across a re-install.
+#
+# This script regenerates config.yaml from scratch and deliberately omits
+# kube-apiserver-arg (the OIDC webhook does not exist at bootstrap). That is
+# correct on a FIRST install and destructive on a repair: `kube-dc bootstrap
+# install --force` on a cluster that has completed the OIDC cutover would drop
+# the webhook flags and restart the apiserver, turning every Keycloak JWT back
+# into a 401 — with no error anywhere, because the cluster is otherwise healthy.
+#
+# The same applies to any apiserver flags the operator added themselves (audit
+# logging, feature gates). So capture the existing block verbatim and re-append
+# it after the new config is written.
+PRESERVED_APISERVER_ARGS=""
+if [[ -f "${RANCHER_DIR}/config.yaml" ]]; then
+    PRESERVED_APISERVER_ARGS="$(awk '
+        /^kube-apiserver-arg:[[:space:]]*$/ { inblock=1; print; next }
+        inblock {
+            # A sequence item belongs to the block whether it is indented or
+            # flush with the key (RKE2 writes it flush).
+            if ($0 ~ /^[[:space:]]*-[[:space:]]/) { print; next }
+            if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/) { next }
+            inblock=0
+        }
+    ' "${RANCHER_DIR}/config.yaml")"
+    if [[ -n "${PRESERVED_APISERVER_ARGS}" ]]; then
+        log_info "Preserving existing kube-apiserver-arg block across re-install"
+    fi
+fi
+
+# kube-apiserver audit policy. It records at Metadata level, never a request or
+# response body: every Secret request; pod log, exec, attach, port-forward and
+# proxy access; workload writes by anyone but kube-system controllers and nodes;
+# and managed-service intent writes. It is written before config.yaml, whose
+# audit-policy-file key names it, because kube-apiserver does not start without
+# the file. It is inline, not a sibling file, because the kube-dc CLI stages only
+# this script on the node. Keep it byte-identical in both installer copies; the
+# CLI test pins its sha256.
+cat > "${RANCHER_DIR}/kube-dc-audit-policy.yaml" <<'AUDIT_POLICY_EOF'
+# kube-apiserver audit policy for Kube-DC managed-services credential access
+# (revision 3). Metadata level only: no request or response object is recorded.
+# The scope and the accepted residuals are stated in the rollout design; in
+# particular a request URI (exec arguments included) is always recorded.
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages:
+  - RequestReceived
+rules:
+  # Every request on a Secret: every verb, every identity, no exclusion. A read,
+  # a write, and a merge patch used to read back the stored object are recorded.
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets"]
+  # Every way to reach what a running pod holds. kube-dc denies tenants exec and
+  # attach in Project namespaces, but every Project role grants pods/log, so a
+  # Job that prints a mounted Secret and `kubectl logs` is the ordinary path.
+  - level: Metadata
+    resources:
+      - group: ""
+        resources:
+          - pods/log
+          - pods/exec
+          - pods/attach
+          - pods/portforward
+          - pods/proxy
+          - pods/ephemeralcontainers
+          - services/proxy
+  # Built-in controllers and nodes act for a workload someone else created or
+  # changed; the next rule records that person.
+  - level: None
+    userGroups: ["system:serviceaccounts:kube-system", "system:nodes"]
+    resources:
+      - group: ""
+        resources: ["pods"]
+      - group: "apps"
+        resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+      - group: "batch"
+        resources: ["jobs", "cronjobs"]
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+  # Who creates, changes or deletes a workload that could mount a Secret. Status
+  # and scale subresources are not listed, so their churn is not recorded.
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["pods"]
+      - group: "apps"
+        resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+      - group: "batch"
+        resources: ["jobs", "cronjobs"]
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+  # Writes to the tenant-facing service intents and to the reservation an
+  # operator retires (CP-7). These objects carry references, never values.
+  - level: Metadata
+    resources:
+      - group: "services.kube-dc.com"
+        resources:
+          - managedservices
+          - serviceoperations
+          - servicebindings
+          - servicecredentialpolicies
+          - cellreservations
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+  # Nothing else.
+  - level: None
+AUDIT_POLICY_EOF
+chmod 0600 "${RANCHER_DIR}/kube-dc-audit-policy.yaml"
+log_info "Audit policy written to ${RANCHER_DIR}/kube-dc-audit-policy.yaml"
+
+# Generate config.yaml
+if [[ -n "${JOIN_TOKEN}" && -n "${JOIN_SERVER}" ]]; then
+    log_info "Mode: Joining existing cluster at ${JOIN_SERVER}"
+
+    cat > "${RANCHER_DIR}/config.yaml" <<EOF
+server: https://${JOIN_SERVER}:${CP_PORT}
+token: ${JOIN_TOKEN}
+node-name: ${NODE_NAME}
+node-ip: ${NODE_IP}
+node-external-ip: ${EXTERNAL_IP}
+disable-cloud-controller: true
+disable:
+  - rke2-ingress-nginx
+  # Traefik is RKE2's DEFAULT packaged ingress and must be disabled too:
+  # kube-dc serves ingress with Envoy Gateway, which owns the Gateway API
+  # CRDs. Left enabled, rke2-traefik-crd fails forever trying to import
+  # them ("exists and cannot be imported into the current release") and
+  # rke2-traefik then fails on the missing CRDs -- observed on
+  # a live cluster at ~600 restarts over 2 days. Worse than the noise:
+  # if it ever succeeded it would contend with Envoy for those CRDs and
+  # for the :80/:443 hostPorts -- a packaged ingress-nginx once hijacked
+  # the API server's :443 exactly that way on a host-network Envoy cluster.
+  - rke2-traefik
+  - rke2-traefik-crd
+cni: none
+cluster-cidr: "${POD_CIDR}"
+service-cidr: "${SERVICE_CIDR}"
+cluster-dns: "${CLUSTER_DNS}"
+node-label:
+  - kube-dc-manager=true
+  - kube-ovn/role=master
+# kube-apiserver-arg deliberately omitted at bootstrap — the webhook flag is
+# added by `kube-dc bootstrap init` in its finalize phase (or by
+# `bootstrap oidc-cutover`) after infra-core brings up the OIDC webhook
+# DaemonSet. Bootstrap apiserver runs cert-only.
+kube-controller-manager-arg:
+  - bind-address=0.0.0.0
+  - authorization-always-allow-paths=/metrics
+kube-scheduler-arg:
+  - bind-address=0.0.0.0
+  - authorization-always-allow-paths=/metrics
+# Memory reservation + eviction thresholds — protects kubelet/containerd/etcd
+# from kernel OOM under sudden pressure. Without these, the cloud cluster's
+# 2026-05-06 incident on a control-plane node happened: memory hit 81G/125G with
+# 8G swap fully consumed, kernel OOM-killed something in the etcd-tmp
+# reconcile path, bbolt corrupted, node took 4 hours to recover. See
+# docs/internal/oidc-webhook-cloud-rollout.md (kube-dc repo) §"Memory
+# protections" for rationale + alert thresholds.
+kubelet-arg:
+  - system-reserved=${KUBELET_SYS_RESERVED}
+  - kube-reserved=${KUBELET_KUBE_RESERVED}
+  - eviction-hard=${KUBELET_EVICTION_HARD}
+  - max-pods=${KUBELET_MAX_PODS}
+  # Bound tenant processes/threads before they exhaust the node PID table.
+  - pod-max-pids=4096
+  # Pin the kubelet default explicitly: the kubepods cgroup stays capped at
+  # allocatable, so a future RKE2/kubelet default change cannot silently drop
+  # the cap that keeps system-reserved/kube-reserved out of tenant reach.
+  - enforce-node-allocatable=pods
+control-plane-resource-requests: ${CP_RESOURCE_REQUESTS}
+etcd-arg:
+  - listen-metrics-urls=http://0.0.0.0:2381
+tls-san:
+  - ${DOMAIN}
+  - ${API_HOSTNAME}
+  - ${EXTERNAL_IP}
+  - ${NODE_IP}
+  - ${JOIN_SERVER}
+advertise-address: ${NODE_IP}
+audit-policy-file: ${RANCHER_DIR}/kube-dc-audit-policy.yaml
+debug: true
+${EMBEDDED_REGISTRY_BLOCK}
+EOF
+else
+    log_info "Mode: Initializing new cluster"
+
+    cat > "${RANCHER_DIR}/config.yaml" <<EOF
+node-name: ${NODE_NAME}
+node-ip: ${NODE_IP}
+node-external-ip: ${EXTERNAL_IP}
+disable-cloud-controller: true
+disable:
+  - rke2-ingress-nginx
+  # Traefik is RKE2's DEFAULT packaged ingress and must be disabled too:
+  # kube-dc serves ingress with Envoy Gateway, which owns the Gateway API
+  # CRDs. Left enabled, rke2-traefik-crd fails forever trying to import
+  # them ("exists and cannot be imported into the current release") and
+  # rke2-traefik then fails on the missing CRDs -- observed on
+  # a live cluster at ~600 restarts over 2 days. Worse than the noise:
+  # if it ever succeeded it would contend with Envoy for those CRDs and
+  # for the :80/:443 hostPorts -- a packaged ingress-nginx once hijacked
+  # the API server's :443 exactly that way on a host-network Envoy cluster.
+  - rke2-traefik
+  - rke2-traefik-crd
+cni: none
+cluster-cidr: "${POD_CIDR}"
+service-cidr: "${SERVICE_CIDR}"
+cluster-dns: "${CLUSTER_DNS}"
+node-label:
+  - kube-dc-manager=true
+  - kube-ovn/role=master
+# kube-apiserver-arg deliberately omitted at bootstrap — see comment above.
+kube-controller-manager-arg:
+  - bind-address=0.0.0.0
+  - authorization-always-allow-paths=/metrics
+kube-scheduler-arg:
+  - bind-address=0.0.0.0
+  - authorization-always-allow-paths=/metrics
+# Memory reservation + eviction thresholds — protects kubelet/containerd/etcd
+# from kernel OOM under sudden pressure. Without these, the cloud cluster's
+# 2026-05-06 incident on a control-plane node happened: memory hit 81G/125G with
+# 8G swap fully consumed, kernel OOM-killed something in the etcd-tmp
+# reconcile path, bbolt corrupted, node took 4 hours to recover. See
+# docs/internal/oidc-webhook-cloud-rollout.md (kube-dc repo) §"Memory
+# protections" for rationale + alert thresholds.
+kubelet-arg:
+  - system-reserved=${KUBELET_SYS_RESERVED}
+  - kube-reserved=${KUBELET_KUBE_RESERVED}
+  - eviction-hard=${KUBELET_EVICTION_HARD}
+  - max-pods=${KUBELET_MAX_PODS}
+  # Bound tenant processes/threads before they exhaust the node PID table.
+  - pod-max-pids=4096
+  # Pin the kubelet default explicitly: the kubepods cgroup stays capped at
+  # allocatable, so a future RKE2/kubelet default change cannot silently drop
+  # the cap that keeps system-reserved/kube-reserved out of tenant reach.
+  - enforce-node-allocatable=pods
+control-plane-resource-requests: ${CP_RESOURCE_REQUESTS}
+etcd-arg:
+  - listen-metrics-urls=http://0.0.0.0:2381
+tls-san:
+  - ${DOMAIN}
+  - ${API_HOSTNAME}
+  - ${EXTERNAL_IP}
+  - ${NODE_IP}
+advertise-address: ${NODE_IP}
+audit-policy-file: ${RANCHER_DIR}/kube-dc-audit-policy.yaml
+debug: true
+${EMBEDDED_REGISTRY_BLOCK}
+EOF
+fi
+
+# Default apiserver feature gates.
+#
+# MutablePVNodeAffinity (alpha in Kubernetes 1.35) makes a PersistentVolume's
+# spec.nodeAffinity mutable. Without it that field is immutable, and a
+# node-local volume (local-path, which is what tenant etcd and the monitoring
+# StatefulSets use because local NVMe is markedly faster than network storage
+# for etcd fsyncs) is welded to the node that first bound it forever. Moving one
+# then means delete + recreate + restore-from-backup, and a node with a pinned
+# single-replica volume cannot be drained for maintenance at all.
+#
+# With the gate on, migration is: scale the workload to 0, copy the data
+# directory to the target node, repoint spec.nodeAffinity, scale back up. That
+# keeps local-disk performance AND makes nodes drainable.
+#
+# It is alpha, so it is off by default upstream and could change shape in a
+# future release. It only relaxes a validation rule — nothing reads it at
+# runtime — so the blast radius of it misbehaving is a rejected PATCH, not a
+# broken cluster. Re-evaluate at each Kubernetes minor bump.
+DEFAULT_APISERVER_FEATURE_GATES="${DEFAULT_APISERVER_FEATURE_GATES:-MutablePVNodeAffinity=true}"
+
+# Build the final kube-apiserver-arg block: whatever the operator already had
+# (OIDC webhook flags, audit config, their own gates) MERGED with our defaults.
+#
+# Merging rather than emitting a second block matters: two top-level
+# kube-apiserver-arg keys are duplicate YAML mapping keys and RKE2 silently
+# honours one and discards the other. Equally, two separate `feature-gates=`
+# entries are two occurrences of the same apiserver flag — so an existing
+# feature-gates line is extended in place, never duplicated.
+APISERVER_ARG_LINES=""
+if [[ -n "${PRESERVED_APISERVER_ARGS}" ]]; then
+    # Drop the key line; we re-emit it below.
+    APISERVER_ARG_LINES="$(printf '%s\n' "${PRESERVED_APISERVER_ARGS}" | grep -vE '^kube-apiserver-arg:[[:space:]]*$' || true)"
+fi
+
+if [[ -n "${DEFAULT_APISERVER_FEATURE_GATES}" ]]; then
+    if printf '%s\n' "${APISERVER_ARG_LINES}" | grep -qE '^[[:space:]]*-[[:space:]]*feature-gates='; then
+        # Extend the existing feature-gates flag, skipping gates already listed.
+        APISERVER_ARG_LINES="$(
+            FG="${DEFAULT_APISERVER_FEATURE_GATES}" awk '
+                /^[[:space:]]*-[[:space:]]*feature-gates=/ {
+                    n = split(ENVIRON["FG"], want, ",")
+                    for (i = 1; i <= n; i++) {
+                        split(want[i], kv, "=")
+                        if (index($0, kv[1] "=") == 0) { $0 = $0 "," want[i] }
+                    }
+                }
+                { print }
+            ' <<< "${APISERVER_ARG_LINES}"
+        )"
+    else
+        APISERVER_ARG_LINES="${APISERVER_ARG_LINES:+${APISERVER_ARG_LINES}$'\n'}  - feature-gates=${DEFAULT_APISERVER_FEATURE_GATES}"
+    fi
+fi
+
+if [[ -n "${APISERVER_ARG_LINES}" ]]; then
+    if grep -qE '^kube-apiserver-arg:[[:space:]]*$' "${RANCHER_DIR}/config.yaml"; then
+        log_warn "Generated config already declares kube-apiserver-arg; NOT appending."
+        log_warn "Intended content follows — merge it by hand:"
+        printf 'kube-apiserver-arg:\n%s\n' "${APISERVER_ARG_LINES}" >&2
+    else
+        printf 'kube-apiserver-arg:\n%s\n' "${APISERVER_ARG_LINES}" >> "${RANCHER_DIR}/config.yaml"
+        if [[ -n "${PRESERVED_APISERVER_ARGS}" ]]; then
+            log_info "Wrote kube-apiserver-arg (preserved operator flags + default feature gates)"
+        else
+            log_info "Wrote kube-apiserver-arg (default feature gates: ${DEFAULT_APISERVER_FEATURE_GATES})"
+        fi
+    fi
+fi
+
+log_info "Config written to ${RANCHER_DIR}/config.yaml"
+
+# Re-enable ext4 write barriers on the root filesystem.
+#
+# CloudSigma's stock Ubuntu image ships / in fstab as "defaults,discard,nobarrier"
+# on a virtio disk that reports a write-back cache. nobarrier removes the
+# flush/FUA that makes ext4's journal commit durable, so any hard reset (host
+# event, forced power-off) loses acknowledged writes and the filesystem comes
+# back inconsistent — "freeing already freed block", directory checksum
+# failures — then containerd's bbolt store tears days later and the node dies
+# with "container runtime is down". On one CloudSigma site this hit two management nodes and
+# every tenant worker from one host event around 2026-08-22 00:00 UTC. We do
+# not add nobarrier anywhere; we inherit it, so strip it here before RKE2
+# writes anything. The remount is online-safe. Nodes on images without the
+# option are untouched (the sed is a no-op).
+if grep -qE '^[^#].*[[:space:]]/[[:space:]]+ext4[[:space:]].*nobarrier' /etc/fstab 2>/dev/null; then
+    sed -i.bak-nobarrier -E '/[[:space:]]\/[[:space:]]+ext4[[:space:]]/s/,?nobarrier//' /etc/fstab
+    if mount -o remount,barrier=1 /; then
+        log_info "Root filesystem: removed nobarrier from fstab and re-enabled write barriers"
+    else
+        log_warn "Root filesystem: removed nobarrier from fstab but the live remount failed — barriers apply from the next boot"
+    fi
+fi
+
+# Install RKE2
+log_info "Installing RKE2 ${RKE2_VERSION}..."
+export INSTALL_RKE2_VERSION="${RKE2_VERSION}"
+export INSTALL_RKE2_TYPE="server"
+if [[ -n "${KDC_RKE2_INSTALLER:-}" ]]; then
+    sh "${KDC_RKE2_INSTALLER}"
+else
+    curl -sfL https://get.rke2.io | sh -
+fi
+
+# Enable and start service
+log_info "Enabling rke2-server service..."
+systemctl enable rke2-server.service
+
+log_info "Starting rke2-server service..."
+systemctl start rke2-server.service
+
+# Wait for RKE2 to become active
+log_info "Waiting for RKE2 to start (this may take a few minutes)..."
+for i in {1..30}; do
+    if systemctl is-active rke2-server.service >/dev/null 2>&1; then
+        log_info "RKE2 server is active"
+        break
+    fi
+    sleep 10
+    echo -n "."
+done
+echo ""
+
+# ASSERT, do not assume. The loop above simply falls through after 300s, so
+# without this the script went on to print "Installation Complete" for a service
+# that never started — the operator then spent the next phase debugging Flux
+# against a cluster that does not exist.
+if ! systemctl is-active rke2-server.service >/dev/null 2>&1; then
+    log_error "rke2-server did not become active within 300s."
+    log_error "Inspect the cause on this node:"
+    log_error "  journalctl -u rke2-server -n 200 --no-pager"
+    log_error "  systemctl status rke2-server"
+    exit 1
+fi
+
+# Service active is NOT the same as apiserver serving. Wait for the API to
+# answer /readyz on LOOPBACK — never the node IP, which Envoy's :6443
+# SNI-passthrough listener can capture on a converged cluster and make a healthy
+# apiserver look dead.
+log_info "Waiting for kube-apiserver to report ready..."
+API_READY=""
+for i in {1..30}; do
+    code="$(curl -sk -o /dev/null -w '%{http_code}' "https://127.0.0.1:${CP_PORT_API:-6443}/readyz" 2>/dev/null || true)"
+    if [[ "${code}" == "200" || "${code}" == "401" || "${code}" == "403" ]]; then
+        # 401/403 still proves the API is up and serving; this early it has no
+        # authorization for an anonymous probe.
+        API_READY=1
+        log_info "kube-apiserver is serving (HTTP ${code})"
+        break
+    fi
+    sleep 5
+    echo -n "."
+done
+echo ""
+if [[ -z "${API_READY}" ]]; then
+    log_error "rke2-server is active but kube-apiserver never answered on https://127.0.0.1:6443/readyz."
+    log_error "The service is up and the cluster is NOT usable. Inspect:"
+    log_error "  journalctl -u rke2-server -n 200 --no-pager"
+    log_error "  ls -l ${RANCHER_DIR}/rke2.yaml"
+    exit 1
+fi
+
+# Setup kubeconfig
+log_info "Setting up kubeconfig..."
+mkdir -p ~/.kube
+if [[ ! -s "${RANCHER_DIR}/rke2.yaml" ]]; then
+    log_error "${RANCHER_DIR}/rke2.yaml is missing or empty even though the apiserver is serving."
+    log_error "Refusing to write an empty ~/.kube/config."
+    exit 1
+fi
+cp "${RANCHER_DIR}/rke2.yaml" ~/.kube/config
+chmod 600 ~/.kube/config
+
+# Update kubeconfig with correct server address
+sed -i "s|https://127.0.0.1:6443|https://${NODE_IP}:6443|g" ~/.kube/config
+
+# Add kubectl to PATH
+export PATH="${PATH}:/var/lib/rancher/rke2/bin"
+echo 'export PATH="${PATH}:/var/lib/rancher/rke2/bin"' >> ~/.bashrc
+
+# Display node token for joining other nodes
+if [[ -z "${JOIN_TOKEN}" ]]; then
+    log_info "=== Cluster initialized successfully ==="
+    echo ""
+    log_info "Node token (save this for joining other nodes):"
+    cat /var/lib/rancher/rke2/server/node-token
+    echo ""
+fi
+
+log_info "=== Installation Complete ==="
+log_info "Kubeconfig: ~/.kube/config"
+log_info ""
+log_info "To check node status:"
+log_info "  export PATH=\${PATH}:/var/lib/rancher/rke2/bin"
+log_info "  kubectl get nodes"
+
+# The OIDC cutover still has to happen, but since 2026-08-28 `kube-dc bootstrap
+# init` performs it automatically as its last finalize step. This banner used to
+# say "MANDATORY POST-INSTALL STEP" and hand the operator a runbook; that is now
+# wrong for the normal path and would send people to do by hand what init is
+# about to do for them. It stays loud because the failure mode has not changed
+# (a production cluster ran 28 days cert-only, every UI write returning HTTP
+# 401) and because `bootstrap install` can be run WITHOUT ever running init, in
+# which case nothing else will do it.
+echo ""
+echo "======================================================================"
+echo "  !  This cluster cannot accept a Keycloak login yet"
+echo "======================================================================"
+echo ""
+echo "  RKE2 is installed with cert-only authn. Tenant kubectl via Keycloak"
+echo "  JWT, the UI's Manage-Organization API calls, and the k8-manager /"
+echo "  db-manager operators all need the OIDC webhook flag on every CP node."
+echo "  Without it every JWT returns HTTP 401 while the cluster looks"
+echo "  completely healthy."
+echo ""
+echo "  If your next step is 'kube-dc bootstrap init', there is NOTHING to do"
+echo "  here: init wires every control-plane node itself, as its last finalize"
+echo "  step, once Flux has brought up infra-core. Watch for the 'Wire"
+echo "  apiservers to OIDC' milestone, and read the end of that run - init"
+echo "  says so loudly if it could not finish."
+echo ""
+echo "  Do it by hand only if you are NOT running init on this cluster, if"
+echo "  init deferred the step, or if you passed --no-oidc-cutover / --no-ssh."
+echo "  Wait for Flux to finish 'infra-core' first:"
+echo "    kubectl -n oidc-webhook-authenticator get pods -o wide   # one per CP, all Ready"
+echo "    ls /etc/rancher/oidc-webhook-kubeconfig.yaml              # on each CP node"
+echo ""
+echo "  Then, from the machine that can SSH to the control-plane nodes:"
+echo "    kube-dc bootstrap oidc-cutover --dry-run     # review"
+echo "    kube-dc bootstrap oidc-cutover               # apply"
+echo "  (it takes no cluster name - it acts on the current kubeconfig)"
+echo ""
+echo "  It wires every node one at a time, gating each on its apiserver"
+echo "  returning, and refuses to leave the cluster half-wired (which causes"
+echo "  intermittent 401s). It also checks the things that break a node when"
+echo "  done by hand: a pre-existing kube-apiserver-arg block (appending a"
+echo "  second one makes RKE2 silently discard flags), and anything else"
+echo "  already holding :6443 (after which kube-apiserver cannot re-bind)."
+echo ""
+echo "  Verify either way:  kube-dc bootstrap accept <cluster> --domain <domain>"
+echo "======================================================================"

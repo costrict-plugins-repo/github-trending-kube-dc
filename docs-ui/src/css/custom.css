@@ -1,0 +1,633 @@
+/* Import Red Hat fonts - PatternFly */
+@import url('https://fonts.googleapis.com/css2?family=Red+Hat+Display:wght@400;500;700&family=Red+Hat+Text:wght@400;500&display=swap');
+
+/**
+ * Kube-DC Dashboard theme for documentation
+ * Matches the main dashboard UI styling
+ */
+
+/* Kube-DC color palette - matching dashboard */
+:root {
+  /* Primary colors from dashboard */
+  --ifm-color-primary: #0066cc;
+  --ifm-color-primary-dark: #0059b3;
+  --ifm-color-primary-darker: #004d99;
+  --ifm-color-primary-darkest: #003d7a;
+  --ifm-color-primary-light: #1976d2;
+  --ifm-color-primary-lighter: #4a90e2;
+  --ifm-color-primary-lightest: #6ca0dc;
+
+  /* Dashboard masthead color */
+  --ifm-navbar-background-color: #002952;
+  --ifm-navbar-link-color: #ffffff;
+  --ifm-navbar-link-hover-color: #ffffff;
+
+  /* Background colors */
+  --ifm-background-color: #fafafa;
+  --ifm-background-surface-color: #ffffff;
+
+  /* Font - PatternFly uses Red Hat Text for body, Red Hat Display for headings */
+  --ifm-font-family-base: 'Red Hat Text', 'RedHatText', -apple-system, BlinkMacSystemFont, sans-serif;
+  --ifm-heading-font-family: 'Red Hat Display', 'RedHatDisplay', -apple-system, BlinkMacSystemFont, sans-serif;
+  --ifm-code-font-size: 90%;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.1);
+
+  /* Status colors from dashboard */
+  --kube-dc-green: #6EC664;
+  --kube-dc-red: #C9190B;
+  --kube-dc-yellow: #F4C145;
+  --kube-dc-grey: #8A8D90;
+}
+
+[data-theme='dark'] {
+  --ifm-color-primary: #4a90e2;
+  --ifm-color-primary-dark: #3380d8;
+  --ifm-color-primary-darker: #2670ce;
+  --ifm-color-primary-darkest: #1a5bb8;
+  --ifm-color-primary-light: #6ca0dc;
+  --ifm-color-primary-lighter: #85b0e0;
+  --ifm-color-primary-lightest: #a3c5e8;
+  --docusaurus-highlighted-code-line-bg: rgba(0, 0, 0, 0.3);
+
+  --ifm-navbar-background-color: #002952;
+  --ifm-background-color: #1a1a1a;
+  --ifm-background-surface-color: #242424;
+}
+
+/* GitHub-like inline code inside documentation prose */
+.theme-doc-markdown :not(pre) > code {
+  padding: 0.15em 0.35em;
+  margin: 0;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.9em;
+  font-weight: 400;
+  line-height: inherit;
+  color: inherit;
+  background-color: rgba(175, 184, 193, 0.2);
+  border: 0;
+  border-radius: 4px;
+  box-shadow: none;
+}
+
+/* Dark theme equivalent */
+[data-theme='dark'] .theme-doc-markdown :not(pre) > code {
+  color: inherit;
+  background-color: rgba(110, 118, 129, 0.4);
+}
+
+/* ============================================
+   Sidebar - PatternFly v5 Navigation style
+   https://v5-archive.patternfly.org/components/navigation/#mixed
+   ============================================ */
+
+/* Base sidebar link */
+.menu__link {
+  font-family: 'Red Hat Text', 'RedHatText', sans-serif !important;
+  font-size: 16px !important;
+  font-weight: 400 !important;
+  line-height: 1.5 !important;
+  color: #151515 !important;
+  padding: 10px 16px 10px 16px !important;
+  border-radius: 0 !important;
+  border-left: none !important;
+  transition: background-color 0.15s ease !important;
+}
+
+[data-theme='dark'] .menu__link {
+  color: #e0e0e0 !important;
+}
+
+/* Category headers (collapsible) — slightly bolder, with separator */
+.menu__list-item-collapsible {
+  border-top: 1px solid #d2d2d2 !important;
+  margin-bottom: 0 !important;
+}
+
+.menu__list-item-collapsible:first-child {
+  border-top: none !important;
+}
+
+[data-theme='dark'] .menu__list-item-collapsible {
+  border-top-color: #3d3d3d !important;
+}
+
+.menu__list-item-collapsible > .menu__link {
+  font-family: 'Red Hat Display', 'RedHatDisplay', sans-serif !important;
+  font-size: 16px !important;
+  font-weight: 400 !important;
+  padding: 14px 16px !important;
+  color: #151515 !important;
+}
+
+[data-theme='dark'] .menu__list-item-collapsible > .menu__link {
+  color: #e0e0e0 !important;
+}
+
+/* Expanded category header — light background */
+.menu__list-item-collapsible:has(+ .menu__list) .menu__link,
+.menu__list-item--collapsed .menu__link {
+  background-color: transparent !important;
+}
+
+/* Hover state */
+.menu__link:hover {
+  background-color: #f0f0f0 !important;
+  color: #151515 !important;
+}
+
+[data-theme='dark'] .menu__link:hover {
+  background-color: rgba(255, 255, 255, 0.07) !important;
+  color: #ffffff !important;
+}
+
+/* Active sidebar item — light blue background */
+.menu__link--active {
+  background-color: #d7e9f7 !important;
+  color: #151515 !important;
+  font-weight: 500 !important;
+  border-left: none !important;
+}
+
+.menu__link--active:not(.menu__list-item-collapsible > .menu__link) {
+  position: relative;
+}
+
+.menu__link--active:not(.menu__list-item-collapsible > .menu__link)::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 3px;
+  background-color: #0066cc;
+  border-radius: 0 3px 3px 0;
+}
+
+[data-theme='dark'] .menu__link--active {
+  background-color: rgba(74, 144, 226, 0.2) !important;
+  color: #fff !important;
+}
+
+[data-theme='dark'] .menu__link--active::before {
+  background-color: #4a90e2;
+}
+
+/* Nested items (sub-nav) */
+.menu__list .menu__list {
+  margin-left: 0 !important;
+  padding-left: 0 !important;
+}
+
+.menu__list .menu__list .menu__link {
+  font-size: 14px !important;
+  padding: 8px 16px 8px 40px !important;
+}
+
+/* Category toggle arrow */
+.menu__caret {
+  padding: 0 !important;
+}
+
+.menu__caret::before {
+  transition: transform 0.2s ease !important;
+}
+
+/* Navbar - matching dashboard masthead */
+.navbar {
+  background-color: var(--ifm-navbar-background-color) !important;
+  box-shadow: 0 4px 2px -2px rgba(0, 0, 0, 0.3);
+}
+
+.navbar__title {
+  color: var(--ifm-navbar-link-color) !important;
+  font-weight: 600;
+}
+
+.navbar__item,
+.navbar__link {
+  color: var(--ifm-navbar-link-color) !important;
+}
+
+.navbar__link:hover {
+  color: var(--ifm-navbar-link-hover-color) !important;
+  opacity: 0.9;
+}
+
+/* Dropdown menu styling */
+.dropdown__menu {
+  background-color: var(--ifm-navbar-background-color);
+}
+
+.dropdown__link {
+  color: var(--ifm-navbar-link-color) !important;
+}
+
+.dropdown__link:hover {
+  background-color: rgba(255, 255, 255, 0.1);
+}
+
+/* Main content area - light grey background like dashboard */
+main {
+  background-color: var(--ifm-background-color);
+}
+
+/* Mobile: match main background to article surface color so there is no
+   color-contrast "border" around the content card */
+@media screen and (max-width: 996px) {
+  main {
+    background-color: var(--ifm-background-surface-color);
+  }
+
+  [data-theme='dark'] main {
+    background-color: var(--ifm-background-color);
+  }
+}
+
+/* Article/doc container - white background */
+article {
+  background-color: var(--ifm-background-surface-color);
+  padding: 2rem;
+  border-radius: 4px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+@media screen and (max-width: 996px) {
+  article {
+    border-radius: 0;
+    box-shadow: none;
+    background-color: transparent;
+  }
+}
+
+/* Footer styling */
+.footer {
+  background-color: var(--ifm-navbar-background-color);
+  color: var(--ifm-navbar-link-color);
+}
+
+.footer__title,
+.footer__item,
+.footer__link-item {
+  color: var(--ifm-navbar-link-color) !important;
+}
+
+.footer__link-item:hover {
+  opacity: 0.8;
+}
+
+/* Sidebar styling - cleaner look */
+.theme-doc-sidebar-container {
+  background-color: var(--ifm-background-surface-color);
+  border-right: 1px solid #e0e0e0;
+}
+
+[data-theme='dark'] .theme-doc-sidebar-container {
+  border-right-color: #3d3d3d;
+}
+
+/* Table styling - matching dashboard tables */
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+table thead {
+  background-color: #f5f5f5;
+}
+
+[data-theme='dark'] table thead {
+  background-color: #2d2d2d;
+}
+
+table tbody tr:hover {
+  background-color: #f5f5f5;
+  transition: background-color 0.15s ease-in-out;
+}
+
+[data-theme='dark'] table tbody tr:hover {
+  background-color: #2d2d2d;
+}
+
+/* Admonitions - using dashboard status colors */
+.alert--success {
+  --ifm-alert-background-color: rgba(110, 198, 100, 0.1);
+  --ifm-alert-border-color: var(--kube-dc-green);
+}
+
+.alert--danger {
+  --ifm-alert-background-color: rgba(201, 25, 11, 0.1);
+  --ifm-alert-border-color: var(--kube-dc-red);
+}
+
+.alert--warning {
+  --ifm-alert-background-color: rgba(244, 193, 69, 0.1);
+  --ifm-alert-border-color: var(--kube-dc-yellow);
+}
+
+.alert--info {
+  --ifm-alert-background-color: rgba(0, 102, 204, 0.1);
+  --ifm-alert-border-color: var(--ifm-color-primary);
+}
+
+/* Buttons - matching dashboard primary button */
+.button--primary {
+  background-color: var(--ifm-color-primary);
+  border-color: var(--ifm-color-primary);
+}
+
+.button--primary:hover {
+  background-color: var(--ifm-color-primary-dark);
+  border-color: var(--ifm-color-primary-dark);
+}
+
+/* Tabs - matching dashboard tabs */
+.tabs__item--active {
+  border-bottom-color: #40199A;
+  border-bottom-width: 2px;
+}
+
+/* Code blocks - better styling and contrast */
+pre {
+  border-radius: 4px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+}
+
+/* Preserve code and ASCII-diagram geometry. Long lines scroll inside the code
+   block instead of wrapping and breaking boxes, arrows, trees, or commands. */
+.theme-doc-markdown pre,
+.theme-doc-markdown pre code,
+.theme-code-block pre,
+.theme-code-block pre code {
+  white-space: pre !important;
+  overflow-wrap: normal !important;
+  word-break: normal !important;
+}
+
+.theme-doc-markdown pre {
+  overflow-x: auto;
+}
+
+/* Fix code block background in light theme for better readability */
+html[data-theme='light'] pre,
+html[data-theme='light'] pre[class*='language-'],
+html[data-theme='light'] div[class*='codeBlock'] pre {
+  background-color: #f6f8fa !important;
+}
+
+html[data-theme='light'] code[class*='language-'],
+html[data-theme='light'] pre[class*='language-'] code {
+  background-color: transparent !important;
+  color: #24292e !important;
+  text-shadow: none !important;
+}
+
+/* Ensure syntax highlighting is visible in light theme */
+html[data-theme='light'] .token.comment,
+html[data-theme='light'] .token.prolog,
+html[data-theme='light'] .token.doctype,
+html[data-theme='light'] .token.cdata {
+  color: #6a737d !important;
+}
+
+html[data-theme='light'] .token.punctuation {
+  color: #24292e !important;
+}
+
+html[data-theme='light'] .token.property,
+html[data-theme='light'] .token.tag,
+html[data-theme='light'] .token.boolean,
+html[data-theme='light'] .token.number,
+html[data-theme='light'] .token.constant,
+html[data-theme='light'] .token.symbol,
+html[data-theme='light'] .token.deleted {
+  color: #005cc5 !important;
+}
+
+html[data-theme='light'] .token.selector,
+html[data-theme='light'] .token.attr-name,
+html[data-theme='light'] .token.string,
+html[data-theme='light'] .token.char,
+html[data-theme='light'] .token.builtin,
+html[data-theme='light'] .token.inserted {
+  color: #032f62 !important;
+}
+
+html[data-theme='light'] .token.operator,
+html[data-theme='light'] .token.entity,
+html[data-theme='light'] .token.url,
+html[data-theme='light'] .language-css .token.string,
+html[data-theme='light'] .style .token.string {
+  color: #d73a49 !important;
+}
+
+html[data-theme='light'] .token.atrule,
+html[data-theme='light'] .token.attr-value,
+html[data-theme='light'] .token.keyword {
+  color: #d73a49 !important;
+}
+
+html[data-theme='light'] .token.function,
+html[data-theme='light'] .token.class-name {
+  color: #6f42c1 !important;
+}
+
+html[data-theme='light'] .token.regex,
+html[data-theme='light'] .token.important,
+html[data-theme='light'] .token.variable {
+  color: #e36209 !important;
+}
+
+/* Theme toggle button - white icon with transparent background */
+button[class*='colorModeToggle'],
+button[class*='toggleButton'] {
+  background-color: transparent !important;
+  border: none !important;
+  padding: 0.5rem !important;
+}
+
+button[class*='colorModeToggle']:hover,
+button[class*='toggleButton']:hover {
+  background-color: rgba(255, 255, 255, 0.15) !important;
+}
+
+button[class*='colorModeToggle'] svg,
+button[class*='toggleButton'] svg {
+  color: #ffffff !important;
+  width: 20px !important;
+  height: 20px !important;
+}
+
+/* Mobile sidebar drawer - use surface background so it respects light/dark theme,
+   not the dark navbar color */
+.navbar-sidebar {
+  background-color: var(--ifm-background-surface-color) !important;
+}
+
+.navbar-sidebar__brand {
+  background-color: var(--ifm-navbar-background-color) !important;
+}
+
+.navbar-sidebar__items {
+  background-color: var(--ifm-background-surface-color) !important;
+}
+
+/* Search bar styling */
+.DocSearch-Button {
+  background-color: rgba(255, 255, 255, 0.1) !important;
+  border: 1px solid rgba(255, 255, 255, 0.2) !important;
+}
+
+.DocSearch-Button:hover {
+  background-color: rgba(255, 255, 255, 0.15) !important;
+}
+
+/* ---------------------------------------------------------------------------
+   Documentation images
+   ---------------------------------------------------------------------------
+   Rule: an image renders at its NATURAL size, never wider than the content
+   column and never upscaled.
+
+   - Small captures (cards, modals, dropdowns, single rows) show 1:1 and look
+     "normal" with no author effort.
+   - Large captures (wide tables, whole-page screenshots) scale down to fill
+     the column, which keeps their text as legible as the layout allows.
+
+   This replaced a fixed `max-width: 450px` default plus a list of magic
+   alt-text keywords ("dashboard", "list", "diagram"…) that widened whichever
+   images happened to match. Wide screenshots whose alt text missed a keyword
+   were crushed to 450px and became unreadable. Do not reintroduce
+   size-by-alt-text: alt text is for accessibility, not layout.
+
+   Retina: screenshots are captured on 2x displays, so natural pixel width is
+   twice the depicted UI size. src/clientModules/retinaImages.ts detects 2x
+   captures via the PNG pHYs DPI chunk (Mac Retina = 144 dpi) and halves their
+   rendered width so they appear at true UI scale; the max-width here still
+   clamps them to the column. 1x exports and diagrams render natural.
+
+   Need an exception? Use a class, not a keyword:
+     <img className="screenshot-narrow" …/>   cap at 480px
+     <img className="screenshot-full"   …/>   ignore the column cap
+--------------------------------------------------------------------------- */
+article img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 1.25rem 0;
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+/* Opt-in: hold a small decorative image back from filling the column. */
+article img.screenshot-narrow {
+  max-width: 480px;
+}
+
+/* Opt-in: let an exceptionally wide capture use every available pixel. */
+article img.screenshot-full {
+  max-width: none;
+  width: 100%;
+}
+
+/* Datasheet reading rhythm
+ *
+ * Datasheets are longer than the task-oriented guides. Keep the prose at a
+ * readable measure and use deliberate section spacing, while diagrams,
+ * screenshots, tables, and code retain the full article width. */
+[class*='docs-doc-id-draft-artifact-a-datasheet'] .theme-doc-markdown,
+[class*='docs-doc-id-function-'] .theme-doc-markdown {
+  --ifm-leading: 1.55;
+}
+
+[class*='docs-doc-id-draft-artifact-a-datasheet'] .theme-doc-markdown > header > h1,
+[class*='docs-doc-id-function-'] .theme-doc-markdown > header > h1 {
+  margin-bottom: 0.75rem;
+  font-size: clamp(2.5rem, 5vw, 3rem);
+  line-height: 1.12;
+  letter-spacing: -0.02em;
+}
+
+[class*='docs-doc-id-draft-artifact-a-datasheet'] .theme-doc-markdown > h2,
+[class*='docs-doc-id-function-'] .theme-doc-markdown > h2 {
+  margin-top: 2.75rem;
+  margin-bottom: 0.75rem;
+  font-size: clamp(1.65rem, 3vw, 2rem);
+  line-height: 1.2;
+}
+
+[class*='docs-doc-id-draft-artifact-a-datasheet'] .theme-doc-markdown > h3,
+[class*='docs-doc-id-function-'] .theme-doc-markdown > h3 {
+  margin-top: 2rem;
+  margin-bottom: 0.625rem;
+}
+
+[class*='docs-doc-id-draft-artifact-a-datasheet'] .theme-doc-markdown > p,
+[class*='docs-doc-id-draft-artifact-a-datasheet'] .theme-doc-markdown > ul,
+[class*='docs-doc-id-draft-artifact-a-datasheet'] .theme-doc-markdown > ol,
+[class*='docs-doc-id-function-'] .theme-doc-markdown > p,
+[class*='docs-doc-id-function-'] .theme-doc-markdown > ul,
+[class*='docs-doc-id-function-'] .theme-doc-markdown > ol {
+  max-width: 76ch;
+}
+
+[class*='docs-doc-id-draft-artifact-a-datasheet'] .theme-doc-markdown > p,
+[class*='docs-doc-id-function-'] .theme-doc-markdown > p {
+  margin-bottom: 1rem;
+}
+
+[class*='docs-doc-id-draft-artifact-a-datasheet'] .theme-doc-markdown > ul,
+[class*='docs-doc-id-draft-artifact-a-datasheet'] .theme-doc-markdown > ol,
+[class*='docs-doc-id-function-'] .theme-doc-markdown > ul,
+[class*='docs-doc-id-function-'] .theme-doc-markdown > ol {
+  margin-bottom: 1.5rem;
+}
+
+[class*='docs-doc-id-draft-artifact-a-datasheet'] .theme-doc-markdown > ul > li,
+[class*='docs-doc-id-draft-artifact-a-datasheet'] .theme-doc-markdown > ol > li,
+[class*='docs-doc-id-function-'] .theme-doc-markdown > ul > li,
+[class*='docs-doc-id-function-'] .theme-doc-markdown > ol > li {
+  margin-bottom: 0.5rem;
+}
+
+.datasheet-download {
+  max-width: 76ch;
+  margin: 0.25rem 0 1.5rem;
+  padding: 0.625rem 0.875rem;
+  color: var(--ifm-font-color-base);
+  font-size: 0.9375rem;
+  background: color-mix(in srgb, var(--ifm-color-primary) 6%, transparent);
+  border-left: 3px solid var(--ifm-color-primary);
+}
+
+.datasheet-download a {
+  font-weight: 500;
+}
+
+@media screen and (max-width: 576px) {
+  [class*='docs-doc-id-draft-artifact-a-datasheet'] article,
+  [class*='docs-doc-id-function-'] article {
+    padding: 0;
+  }
+
+  [class*='docs-doc-id-draft-artifact-a-datasheet'] .theme-doc-markdown > header > h1,
+  [class*='docs-doc-id-function-'] .theme-doc-markdown > header > h1 {
+    font-size: 2.25rem;
+  }
+}
+
+@media print {
+  .navbar,
+  .theme-doc-sidebar-container,
+  .theme-doc-toc-desktop,
+  .pagination-nav,
+  .footer {
+    display: none !important;
+  }
+
+  .datasheet-download {
+    display: none !important;
+  }
+
+  article {
+    box-shadow: none !important;
+  }
+}

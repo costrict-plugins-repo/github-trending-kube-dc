@@ -1,0 +1,53 @@
+# Registry import: select a digest-pinned ref from the live OS catalog.
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: "{disk-name}"
+  namespace: "{backing-namespace}"
+spec:
+  source:
+    registry:
+      url: "docker://{registry-image}@sha256:{digest}"
+      pullMethod: node
+  pvc:
+    accessModes:
+    - ReadWriteOnce
+    resources:
+      requests:
+        storage: "{size}"
+    storageClassName: "{vm-storage-class}"
+---
+# HTTP import: use for provider-supported custom images or installation media.
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: "{disk-name}-http"
+  namespace: "{backing-namespace}"
+spec:
+  source:
+    http:
+      url: "{image-url}"
+  storage:
+    accessModes:
+    - ReadWriteOnce
+    resources:
+      requests:
+        storage: "{size}"
+    storageClassName: "{vm-storage-class}"
+---
+# Blank additional data disk.
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: "{disk-name}-data"
+  namespace: "{backing-namespace}"
+spec:
+  source:
+    blank: {}
+  storage:
+    accessModes:
+    - ReadWriteOnce
+    resources:
+      requests:
+        storage: "{size}"
+    storageClassName: "{vm-storage-class}"

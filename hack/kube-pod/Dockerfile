@@ -1,0 +1,123 @@
+ARG CLOUDSHELL_VERSION=v0.8.5
+ARG KUBECTL_VERSION=v1.35.0
+ARG STERN_VERSION=1.32.0
+ARG VIRTCTL_VERSION=v1.6.0
+ARG TTYD_VERSION=1.7.8
+ARG K9S_VERSION=v0.50.4
+ARG KUBE_DC_VERSION
+
+# Add a named builder stage for cloudshell
+FROM ghcr.io/cloudtty/cloudshell:${CLOUDSHELL_VERSION} AS cloudshell
+FROM debian:12.10-slim AS base
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    curl \
+    gnupg \
+    apt-transport-https \
+    ca-certificates \
+    lrzsz \
+    git \
+    tmux \
+    screen \
+    jq \
+    openssl \
+    gettext-base \
+    mc \
+    wget \
+    iputils-ping \
+    net-tools \
+    openssh-client \
+    bash-completion \
+    zsh \
+    fish \
+    vim \
+    less \
+    htop \
+    dnsutils \
+    netcat-openbsd \
+    procps && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Build final image
+FROM base AS final
+
+# Redefine ARG to make it available in this build stage
+ARG KUBECTL_VERSION
+ARG STERN_VERSION
+ARG VIRTCTL_VERSION
+ARG TTYD_VERSION
+ARG K9S_VERSION
+ARG KUBE_DC_VERSION
+
+# Create necessary directories
+RUN mkdir -p /usr/local/etc /scripts /root/.kube /usr/lib/ttyd \
+    /etc/bash_completion.d /usr/share/zsh/site-functions \
+    /root/.config/fish/completions
+
+# Install all binaries in a single layer to reduce size
+RUN set -e && \
+    curl -L -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" && \
+    chmod +x /usr/local/bin/kubectl && \
+    curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 && \
+    chmod 700 get_helm.sh && \
+    ./get_helm.sh --no-sudo && \
+    rm get_helm.sh && \
+    curl -LO https://github.com/stern/stern/releases/download/v${STERN_VERSION}/stern_${STERN_VERSION}_linux_amd64.tar.gz && \
+    tar -xvf stern_${STERN_VERSION}_linux_amd64.tar.gz && \
+    mv stern /usr/local/bin/stern && \
+    chmod +x /usr/local/bin/stern && \
+    curl -L -o /usr/local/bin/virtctl https://github.com/kubevirt/kubevirt/releases/download/${VIRTCTL_VERSION}/virtctl-${VIRTCTL_VERSION}-linux-amd64 && \
+    chmod +x /usr/local/bin/virtctl && \
+    ttydArch="$(uname -m)" && \
+    curl -L -o /usr/local/bin/ttyd https://github.com/cloudtty/ttyd/releases/download/${TTYD_VERSION}/ttyd.${ttydArch} && \
+    chmod +x /usr/local/bin/ttyd && \
+    test -n "${KUBE_DC_VERSION}" && \
+    curl -fsSL "https://github.com/kube-dc/kube-dc-public/releases/download/${KUBE_DC_VERSION}/kube-dc_linux_amd64" -o /tmp/kube-dc_linux_amd64 && \
+    curl -fsSL "https://github.com/kube-dc/kube-dc-public/releases/download/${KUBE_DC_VERSION}/checksums.txt" -o /tmp/checksums.txt && \
+    (cd /tmp && sha256sum -c --ignore-missing checksums.txt) && \
+    install -m 0755 /tmp/kube-dc_linux_amd64 /usr/local/bin/kube-dc && \
+    rm /tmp/kube-dc_linux_amd64 /tmp/checksums.txt && \
+    curl -sL https://github.com/derailed/k9s/releases/download/${K9S_VERSION}/k9s_Linux_amd64.tar.gz | tar xz -C /usr/local/bin k9s && \
+    chmod +x /usr/local/bin/k9s
+
+# Generate shell completions for all tools
+RUN kubectl completion bash > /etc/bash_completion.d/kubectl && \
+    kubectl completion zsh > /usr/share/zsh/site-functions/_kubectl && \
+    kubectl completion fish > /root/.config/fish/completions/kubectl.fish && \
+    kube-dc completion bash > /etc/bash_completion.d/kube-dc && \
+    kube-dc completion zsh > /usr/share/zsh/site-functions/_kube-dc && \
+    kube-dc completion fish > /root/.config/fish/completions/kube-dc.fish && \
+    helm completion bash > /etc/bash_completion.d/helm && \
+    helm completion zsh > /usr/share/zsh/site-functions/_helm && \
+    helm completion fish > /root/.config/fish/completions/helm.fish && \
+    stern --completion bash > /etc/bash_completion.d/stern && \
+    stern --completion zsh > /usr/share/zsh/site-functions/_stern && \
+    stern --completion fish > /root/.config/fish/completions/stern.fish && \
+    virtctl completion bash > /etc/bash_completion.d/virtctl && \
+    virtctl completion zsh > /usr/share/zsh/site-functions/_virtctl && \
+    virtctl completion fish > /root/.config/fish/completions/virtctl.fish && \
+    echo 'complete -o default -F __start_kubectl k' >> /etc/bash_completion.d/kubectl
+
+# Copy index.html from cloudshell image
+COPY --from=cloudshell /usr/lib/ttyd/index.html /usr/lib/ttyd/index.html
+
+# Copy all scripts at once to reduce layers
+COPY ./script/startup.sh  /scripts/
+COPY ./script/kubeconfig.tmpl /usr/local/etc/kubeconfig.tmpl
+COPY ./script/.bashrc /root/.bashrc
+COPY ./script/kubectl_console /usr/local/bin/kubectl_console
+COPY ./script/ssh_console /usr/local/bin/ssh_console
+
+# Make scripts executable after they're copied
+RUN chmod +x /scripts/*.sh /usr/local/bin/kubectl_console /usr/local/bin/ssh_console
+
+# Set default environment variables
+ENV KUBECONFIG=/root/.kube/config \
+    CLIENT_ID="kube-dc"
+
+USER root
+WORKDIR /root
+
+ENTRYPOINT ["/scripts/startup.sh"]

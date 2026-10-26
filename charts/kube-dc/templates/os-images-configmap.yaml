@@ -1,0 +1,91 @@
+{{- /*
+OS-image catalog ConfigMap.
+
+The list of entries lives in values.yaml under `osImages.catalog`. Each
+entry's effective `OS_IMAGE_URL` is derived at template time:
+
+  - If `osImages.mirrorBaseURL` is set AND the entry has `mirrorPath`,
+    the effective URL is `<mirrorBaseURL>/<mirrorPath>`. This is how a
+    per-cluster S3 mirror gets wired in without forking the chart.
+
+  - Otherwise the entry's `upstreamURL` is used directly.
+
+The ConfigMap also surfaces `OS_IMAGE_UPSTREAM`, `OS_IMAGE_MIRROR_PATH`
+and `OS_IMAGE_SHA256` to every entry so the fleet's mirror-refresh
+CronJob (kube-dc-fleet/platform/cdi-os-mirror) has the full provenance
+trio without needing to read the chart values separately.
+
+Entries with `containerdiskRepo`/`containerdiskTag` additionally render
+`OS_CONTAINERDISK_REPO`/`OS_CONTAINERDISK_TAG`: the refresh CronJob
+resolves that floating tag to its manifest digest each cycle and
+publishes digest-pinned `registryURL`/`registryDigest` fields into
+cdi-os-catalog (docs/prd/vm-startup-implementation-plan.md M1-T03).
+
+See docs/prd/cdi-acceleration.md.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: images-configmap
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/component: os-images
+data:
+  images.yaml: |
+    images:
+{{- range $.Values.osImages.catalog }}
+      - OS_NAME: {{ .osName | quote }}
+        CLOUD_USER: {{ .cloudUser | quote }}
+        OS_IMAGE_URL: {{ include "kube-dc.osImageURL" (dict "entry" . "root" $) | quote }}
+        OS_IMAGE_UPSTREAM: {{ .upstreamURL | quote }}
+  {{- if .mirrorPath }}
+        OS_IMAGE_MIRROR_PATH: {{ .mirrorPath | quote }}
+  {{- end }}
+  {{- if .sha256 }}
+        OS_IMAGE_SHA256: {{ .sha256 | quote }}
+  {{- end }}
+  {{- if .containerdiskRepo }}
+        OS_CONTAINERDISK_REPO: {{ .containerdiskRepo | quote }}
+  {{- end }}
+  {{- if .containerdiskTag }}
+        OS_CONTAINERDISK_TAG: {{ .containerdiskTag | quote }}
+  {{- end }}
+        MIN_MEMORY: {{ .minMemory | quote }}
+        MIN_VCPU: {{ .minVCPU | quote }}
+        MIN_STORAGE: {{ .minStorage | quote }}
+  {{- if .firmwareType }}
+        FIRMWARE_TYPE: {{ .firmwareType | quote }}
+  {{- end }}
+  {{- if .machineType }}
+        MACHINE_TYPE: {{ .machineType | quote }}
+  {{- end }}
+  {{- if .features }}
+        FEATURES: {{ .features | quote }}
+  {{- end }}
+  {{- if .bootOrder }}
+        BOOT_ORDER: {{ .bootOrder | quote }}
+  {{- end }}
+  {{- if .additionalDisks }}
+        ADDITIONAL_DISKS: {{ .additionalDisks | quote }}
+  {{- end }}
+  {{- if .cloudInit }}
+        CLOUD_INIT: |
+{{ .cloudInit | indent 10 }}
+  {{- end }}
+  {{- if .discovery }}
+        OS_IMAGE_DISCOVERY:
+{{ .discovery | toYaml | indent 10 }}
+  {{- end }}
+  {{- if .familyId }}
+        OS_FAMILY_ID: {{ .familyId | quote }}
+  {{- end }}
+  {{- if hasKey . "guestAgent" }}
+        GUEST_AGENT: {{ .guestAgent | quote }}
+  {{- end }}
+  {{- if hasKey . "sshAccess" }}
+        SSH_ACCESS: {{ .sshAccess | quote }}
+  {{- end }}
+  {{- if hasKey . "cloudInitDisk" }}
+        CLOUD_INIT_DISK: {{ .cloudInitDisk | quote }}
+  {{- end }}
+{{- end }}

@@ -1,0 +1,71 @@
+# Deny `kubectl exec` in project namespaces for everyone except platform
+# system identities. Tenant admin tasks run as Jobs (or via the VM
+# console/VNC for VMs) — see docs/cloud/security-restrictions.md.
+#
+# HISTORY: this policy originally tried to deny exec only into
+# hostPath/hostNetwork/privileged pods, guarding every rule with
+# `oldObject != null`. On CONNECT admission oldObject is ALWAYS null —
+# the API server passes only the PodExecOptions, so a CEL policy cannot
+# see the target pod's spec at all. The conditional design was therefore
+# unimplementable: the null guard made every validation fail, which
+# denied ALL exec (with a misleading hostPath message). The product
+# decision (2026-07-29) is that exec in project namespaces is blocked by
+# design, so the policy now states that intent explicitly. It also
+# backstops RBAC: the standard project roles no longer grant pods/exec,
+# and this policy keeps custom Roles from re-enabling it.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: restrict-pod-exec-in-projects
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CONNECT"]
+        resources: ["pods/exec", "pods/attach"]
+  matchConditions:
+    - name: exclude-system-service-accounts
+      expression: >-
+        !has(request.userInfo) || !has(request.userInfo.username) ||
+        !(['system:serviceaccount:kube-dc:',
+           'system:serviceaccount:kubevirt:',
+           'system:serviceaccount:kamaji-system:',
+           'system:serviceaccount:capi-system:',
+           'system:serviceaccount:capk-system:',
+           'system:serviceaccount:capcs-system:',
+           'system:serviceaccount:capi-k3s-bootstrap-system:',
+           'system:serviceaccount:capi-k3s-control-plane-system:',
+           'system:serviceaccount:capi-kubeadm-bootstrap-system:',
+           'system:serviceaccount:cnpg-system:',
+           'system:serviceaccount:mariadb-system:',
+           'system:serviceaccount:kube-system:'].exists(prefix,
+             request.userInfo.username.startsWith(prefix)))
+    - name: exclude-cluster-admins
+      expression: >-
+        !has(request.userInfo) || !has(request.userInfo.groups) ||
+        !(('system:masters' in request.userInfo.groups || 'platform:admin' in request.userInfo.groups))
+    - name: exclude-node-users
+      expression: >-
+        !has(request.userInfo) || !has(request.userInfo.groups) ||
+        !('system:nodes' in request.userInfo.groups)
+  validations:
+    - expression: "false"
+      message: >-
+        Exec/attach into pods is not allowed in project namespaces.
+        Run administrative tasks as a Job mounting the same volume, or use
+        the VM console/VNC for virtual machines.
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: restrict-pod-exec-in-projects
+spec:
+  policyName: restrict-pod-exec-in-projects
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kube-dc.com/project: ""

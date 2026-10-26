@@ -1,0 +1,66 @@
+{{- $fullName := include "kube-dc.frontend.fullname" . -}}
+{{- $svcPort := .Values.frontend.service.port -}}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- include "kube-dc.frontend.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+  - name: {{ .Values.frontend.gateway.parentRef.name | default "eg" }}
+    namespace: {{ .Values.frontend.gateway.parentRef.namespace | default "envoy-gateway-system" }}
+    sectionName: {{ .Values.frontend.gateway.parentRef.sectionName | default "https-console" }}
+  hostnames:
+  - {{ .Values.frontend.gateway.hostname }}
+  rules:
+  {{- if .Values.ui.enabled }}
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /api/ui/v1
+    timeouts:
+      request: "1h"
+      backendRequest: "1h"
+    backendRefs:
+    - name: {{ $fullName }}
+      port: {{ $svcPort }}
+  {{- end }}
+  # ttyd-backed cloud-shell WebSocket goes through console.<DOMAIN>/api/cloud-shell/...
+  # (nginx inside the frontend pod proxies to the backend). Envoy's default
+  # 15s route timeout closes the WebSocket mid-session and the browser sees
+  # "upstream request timeout". Match this prefix first with a long timeout
+  # so terminal sessions stay open. Gateway API rule matching prefers more
+  # specific PathPrefix, so this rule fires before the `/` catch-all.
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /api/cloud-shell
+    timeouts:
+      request: {{ .Values.frontend.gateway.longLivedTimeout | default "1h" | quote }}
+      backendRequest: {{ .Values.frontend.gateway.longLivedTimeout | default "1h" | quote }}
+    backendRefs:
+    - name: {{ $fullName }}
+      port: {{ $svcPort }}
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: {{ $fullName }}
+      port: {{ $svcPort }}
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-gateway-to-kube-dc-secrets
+  labels:
+    {{- include "kube-dc.frontend.labels" . | nindent 4 }}
+spec:
+  from:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    namespace: envoy-gateway-system
+  to:
+  - group: ""
+    kind: Secret

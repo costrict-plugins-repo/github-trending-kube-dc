@@ -1,0 +1,645 @@
+{{- if and .Values.backend.managedK8sInternalEndpoints (or (lt (int .Values.backend.managedK8sWorkerMTU) 576) (gt (int .Values.backend.managedK8sWorkerMTU) 9000)) }}
+{{- fail "backend.managedK8sInternalEndpoints requires a measured backend.managedK8sWorkerMTU (576..9000)" }}
+{{- end }}
+{{- /* The backend's effective link to the billing service: empty unless
+billing.payg.enabled (see kube-dc.billing.* in _helpers.tpl). The billing maps
+are read through `default dict` so an override that nulls one of them renders
+instead of failing on a nil pointer. */}}
+{{- $billingURL := include "kube-dc.billing.serviceURL" . }}
+{{- $billingIssuer := include "kube-dc.billing.caIssuerName" . }}
+{{- $payg := include "kube-dc.billing.paygEnabled" . }}
+{{- $billingValues := .Values.billing | default dict }}
+{{- $billingService := $billingValues.service | default dict }}
+{{- $selfService := ($billingValues.policy | default dict).selfService | default dict }}
+{{- if and $selfService.enabled (not $payg) }}
+{{- fail "billing.policy.selfService.enabled requires billing.payg.enabled=true: self-service PAYG signup needs the billing service, which the backend is wired to only on a PAYG installation" }}
+{{- end }}
+{{- /* Background workers (ui/backend/jobs/workers.js) write cluster state and
+send email, so exactly one copy may run. With backend.worker.enabled they run in
+a second Deployment rendered from this same template (one replica, Recreate,
+`node worker.js`), so its env and volumes cannot drift from the API's; without
+it they run inside the API process, which therefore must not scale. */}}
+{{- $worker := .Values.backend.worker | default dict }}
+{{- if and (not $worker.enabled) (or .Values.backend.autoscaling.enabled (gt (int .Values.backend.replicaCount) 1)) }}
+{{- fail "backend.replicaCount > 1 or backend.autoscaling.enabled requires backend.worker.enabled=true: without the worker Deployment every API replica runs the billing reconciler and the email workers" }}
+{{- end }}
+{{- $roles := list "api" }}
+{{- if $worker.enabled }}{{- $roles = append $roles "worker" }}{{- end }}
+{{- range $role := $roles }}
+{{- with $ }}
+{{- $isWorker := eq $role "worker" }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kube-dc.backend.fullname" . }}{{ if $isWorker }}-worker{{ end }}
+  labels:
+    {{- if $isWorker }}
+    {{- include "kube-dc.backend.worker.labels" . | nindent 4 }}
+    {{- else }}
+    {{- include "kube-dc.backend.labels" . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- if $isWorker }}
+  # One copy, never two: Recreate stops the old pod before the new one starts.
+  strategy:
+    type: Recreate
+  replicas: 1
+  {{- else }}
+  {{- if .Values.backend.consoleApi.enabled }}
+  strategy:
+    type: Recreate
+  {{- end }}
+  {{- if not .Values.backend.autoscaling.enabled }}
+  replicas: {{ .Values.backend.replicaCount }}
+  {{- end }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- if $isWorker }}
+      {{- include "kube-dc.backend.worker.selectorLabels" . | nindent 6 }}
+      {{- else }}
+      {{- include "kube-dc.backend.selectorLabels" . | nindent 6 }}
+      {{- end }}
+  template:
+    metadata:
+      annotations:
+        # Rolls the backend Pod whenever the master-config Secret content
+        # changes. The Secret is rendered from chart values (SMTP, OpenBao,
+        # ALLOW_PUBLIC_PROJECTS, …). Without this checksum, env vars sourced
+        # via secretKeyRef stay stale on running Pods after a Helm upgrade
+        # that only changed the Secret. See
+        # kube-dc/docs/prd/public-projects-gate.md (F2 review fix).
+        checksum/master-config: {{ include (print $.Template.BasePath "/manager-secret.yaml") . | sha256sum }}
+        {{- if .Values.backend.smtp.enabled }}
+        # Rolls the pods when the SMTP password changes.
+        checksum/smtp-credentials: {{ include (print $.Template.BasePath "/backend-smtp-credentials.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.backend.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- if $isWorker }}
+        {{- include "kube-dc.backend.worker.selectorLabels" . | nindent 8 }}
+        {{- else }}
+        {{- include "kube-dc.backend.selectorLabels" . | nindent 8 }}
+        {{- end }}
+        {{- include "kube-dc.podVersionLabel" . | nindent 8 }}
+        {{- with .Values.backend.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.backend.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "kube-dc.backend.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.backend.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ if $isWorker }}worker{{ else }}{{ .Chart.Name }}{{ end }}
+          securityContext:
+            {{- toYaml .Values.backend.securityContext | nindent 12 }}
+          image: {{ include "kube-dc.ui.image" (dict "image" .Values.backend.image "appVersion" .Chart.AppVersion) | quote }}
+          imagePullPolicy: {{ .Values.frontend.image.pullPolicy }}
+          {{- if $isWorker }}
+          # The image ENTRYPOINT (TLS trust bundle) still runs; only CMD changes.
+          args: ["node", "worker.js"]
+          ports:
+            - name: health
+              containerPort: {{ $worker.healthPort | default 8080 }}
+              protocol: TCP
+          {{- else }}
+          ports:
+            - name: http
+              containerPort: 3333 #{{ .Values.backend.service.port }}
+              protocol: TCP
+            {{- if .Values.backend.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.backend.metrics.port }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.platformApi.enabled }}
+            - name: platform-int
+              containerPort: {{ .Values.platformApi.backendPort }}
+              protocol: TCP
+            {{- end }}
+          {{- end }}
+          env:
+            - name: KUBE_DC_BACKEND_VERSION
+              value: {{ .Values.backend.image.tag | default .Chart.AppVersion | quote }}
+            {{- if $isWorker }}
+            - name: WORKER_HEALTH_PORT
+              value: {{ $worker.healthPort | default 8080 | quote }}
+            {{- else if $worker.enabled }}
+            # The worker Deployment runs the background workers.
+            - name: BACKEND_WORKERS
+              value: "false"
+            {{- end }}
+            {{- if and .Values.backend.consoleApi.enabled (not $isWorker) }}
+            - name: UI_API_ENABLED
+              value: "true"
+            - name: UI_API_REPLICAS
+              value: "1"
+            - name: UI_BACKEND_URL
+              value: {{ printf "https://%s" (required "Console API requires backend.gateway.hostname" .Values.backend.gateway.hostname) | quote }}
+            - name: UI_KEYCLOAK_BASE_URL
+              value: {{ .Values.manager.keycloakSecret.url | quote }}
+            - name: UI_KUBERNETES_API_URL
+              value: {{ .Values.backend.consoleApi.kubernetesApiUrl | quote }}
+            - name: UI_KUBERNETES_CA_FILE
+              value: {{ .Values.backend.consoleApi.kubernetesCaFile | quote }}
+            - name: UI_ALLOWED_ORIGINS
+              value: {{ printf "https://%s,https://%s" .Values.frontend.gateway.hostname (.Values.adminFrontend.gateway.hostname | default (printf "admin.%s" (trimPrefix "console." .Values.frontend.gateway.hostname))) | quote }}
+            - name: UI_SSH_RELAY_URL
+              value: {{ printf "wss://%s/api/ui/v1/vm/relay" .Values.frontend.gateway.hostname | quote }}
+            - name: UI_ENVIRONMENT
+              value: {{ .Values.ui.environment | quote }}
+            - name: UI_TENANT_VLAN_ENABLED
+              value: {{ .Values.projectNetwork.enabled | quote }}
+            - name: UI_ROUTED_NETWORK_ENABLED
+              value: {{ .Values.routedNetwork.enabled | quote }}
+            - name: UI_GPU_ENABLED
+              value: {{ .Values.gpu.enabled | default false | quote }}
+            - name: UI_NETWORK_SOURCE_POLICY_CAPABILITIES
+              value: {{ dict "directLoadBalancer" .Values.backend.exposureSourcePolicy.directLoadBalancer "gateway" .Values.backend.exposureSourcePolicy.gateway "floatingIP" .Values.backend.exposureSourcePolicy.floatingIP | toJson | quote }}
+            - name: UI_NETWORK_SOURCE_POLICY_NAMESPACES
+              value: {{ join "," .Values.backend.exposureSourcePolicy.namespaces | quote }}
+            {{- end }}
+            - name: MANAGED_K8S_WORKER_MTU
+              value: {{ .Values.backend.managedK8sWorkerMTU | default 0 | quote }}
+            - name: MANAGED_K8S_INTERNAL_ENDPOINTS_ENABLED
+              value: {{ .Values.backend.managedK8sInternalEndpoints | default false | quote }}
+            - name: MANAGED_K8S_INTERNAL_ENDPOINT_NAMESPACES
+              value: {{ join "," .Values.backend.managedK8sInternalEndpointNamespaces | quote }}
+            - name: MANAGED_K8S_PUBLIC_API_SOURCE_POLICY_ENABLED
+              value: {{ .Values.backend.managedK8sPublicAPISourcePolicy | default false | quote }}
+            - name: MANAGED_K8S_PUBLIC_API_SOURCE_POLICY_NAMESPACES
+              value: {{ join "," .Values.backend.managedK8sPublicAPISourcePolicyNamespaces | quote }}
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: BRAND_PRODUCT_NAME
+              value: {{ (.Values.branding | default dict).productName | default "Kube-DC" | quote }}
+            # The identity theme reads the public profile from the console
+            # origin. Allow only the configured Keycloak origin for CORS.
+            - name: BRANDING_IDENTITY_ORIGIN
+              value: {{ .Values.manager.keycloakSecret.url | default "" | quote }}
+            - name: BRANDING_IDENTITY_CONFIGURED
+              value: {{ (.Values.branding | default dict).identityRuntimeConfigured | default false | quote }}
+            - name: BRAND_PRIMARY_COLOR
+              value: {{ (.Values.branding | default dict).primaryColor | default "#002952" | quote }}
+            - name: BRAND_ACCENT_COLOR
+              value: {{ (.Values.branding | default dict).accentColor | default "#40199A" | quote }}
+            - name: NOTIFICATION_SUPPORT_PORTAL_URL
+              value: {{ (.Values.notifications | default dict).supportPortalUrl | default "" | quote }}
+            - name: NOTIFICATION_SUPPORT_EMAIL
+              value: {{ (.Values.notifications | default dict).supportEmail | default "" | quote }}
+            - name: NOTIFICATION_PAYMENT_URL
+              value: {{ (.Values.notifications | default dict).paymentUrl | default "" | quote }}
+            - name: STRIPE_SIGNUP_REMINDERS_ENABLED
+              value: {{ dig "stripeSignupRemindersEnabled" true (.Values.notifications | default dict) | quote }}
+            - name: BILLING_NOTIFICATIONS_ENABLED
+              value: {{ ((.Values.notifications | default dict).enabled | default false) | quote }}
+            {{- if .Values.platformApi.enabled }}
+            - name: PLATFORM_INTERNAL_PORT
+              value: {{ .Values.platformApi.backendPort | quote }}
+            - name: PLATFORM_INTERNAL_AUDIENCE
+              value: {{ .Values.platformApi.backendAudience | quote }}
+            - name: PLATFORM_APISERVER_SERVICE_ACCOUNT
+              value: {{ printf "system:serviceaccount:%s:%s-platform-apiserver" .Release.Namespace (include "kube-dc.manager.fullname" .) | quote }}
+            {{- with .Values.platformApi.consoleUrl }}
+            - name: PLATFORM_CONSOLE_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if and .Values.backend.metrics.enabled (not $isWorker) }}
+            - name: METRICS_PORT
+              value: {{ .Values.backend.metrics.port | quote }}
+            {{- end }}
+            - name: GPU_SHARED_CREATION_ENABLED
+              value: {{ .Values.gpu.sharedCreation.enabled | quote }}
+            - name: GPU_VM_CREATION_ENABLED
+              value: {{ .Values.gpu.vmCreation.enabled | quote }}
+            - name: GPU_PROFILE_LABEL
+              value: {{ .Values.gpu.profileLabel | quote }}
+            - name: GPU_HAMI_SCHEDULER_NAME
+              value: {{ .Values.gpu.hamiSchedulerName | quote }}
+            - name: PROM_URL
+              value: "{{ .Values.backend.prometheusUrl | default "http://prom-operator-prometheus.monitoring:9090" }}"
+            - name: PROJECT_SHELL_API_URL
+              value: "{{ .Values.kubeApiExternalUrl }}"
+            {{- if (.Values.backend.cliDiscovery | default dict).caConfigMapName }}
+            - name: KUBE_API_CA_FILE
+              value: /etc/kube-dc/api-ca/ca.crt
+            {{- end }}
+            # Under management-API `service` mode the cloud shell must dial the
+            # kubernetes ServiceIP, not the external hostname. Its SecurityGroup
+            # permits exactly one egress rule — tcp <ServiceIP>/32:443 — and the
+            # node LAN the external hostname resolves to is default-deny. Dialling
+            # the hostname yields "session expired", because the credential exec
+            # cannot reach the apiserver at all.
+            # Empty on every other mode, where the shell keeps the external
+            # hostname and reaches it through the tenant VPC as before.
+            {{- if and (eq .Values.managementAPI.mode "service") .Values.managementAPI.serviceIP }}
+            - name: PROJECT_SHELL_API_SERVICE_URL
+              value: "{{ .Values.managementAPI.serviceIP }}:443"
+            {{- end }}
+            # S3 endpoint for tenant Object Storage views, KdcDatabase
+            # backup wiring, and quota lookups. Per-cluster value —
+            # earlier versions of the JS controllers fell back to a
+            # hardcoded `https://s3.kube-dc.cloud` when the env var
+            # wasn't set, which made every non-cloud cluster's UI
+            # render the wrong S3 hostname. The fall-back is still
+            # there in code (`process.env.S3_ENDPOINT || 'https://s3.kube-dc.cloud'`)
+            # but with this chart change, the env is always set when
+            # `s3Endpoint` is provided in values, so the fallback path
+            # never runs in production. Leave the value empty in
+            # values.yaml if you want the fallback (single-cluster
+            # cloud-only deployment).
+            - name: ROOK_NAMESPACE
+              value: "{{ .Values.objectStorage.rookNamespace }}"
+            - name: CEPH_STORE_NAME
+              value: "{{ .Values.objectStorage.cephStoreName }}"
+            # The admin-ops identity for key management and usage. It is read
+            # with the backend's own service account and never reaches a tenant;
+            # see the objectStorage comment in values.yaml for why an
+            # organization's own user must not carry these capabilities.
+            #
+            # Passed unconditionally, exactly like the manager's copy. This name
+            # is also the organization name both refuse to serve, and the two
+            # must never disagree: if the backend fell back to a built-in default
+            # while the manager reserved a renamed identity, an organization of
+            # that name would sail past the backend's guard.
+            - name: S3_PLATFORM_ADMIN_USER
+              value: "{{ .Values.objectStorage.platformAdminUser.name }}"
+            {{- if .Values.s3Endpoint }}
+            - name: S3_ENDPOINT
+              value: "{{ .Values.s3Endpoint }}"
+            {{- end }}
+            # Public Grafana hostname for the "Open Grafana" SSO
+            # redirect. Same per-cluster pattern as s3Endpoint —
+            # backend has no hardcoded fallback so the launch endpoint
+            # returns 503 when this is unset, rather than silently
+            # sending users to a domain they don't own.
+            {{- if .Values.grafanaUrl }}
+            - name: GRAFANA_URL
+              value: "{{ .Values.grafanaUrl }}"
+            {{- end }}
+            - name: KEYCLOAK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: master-config
+                  key: url
+            - name: CONSOLE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: master-config
+                  key: console_url
+            # Backend's own externally-reachable base URL — used to build links that
+            # must be redeemed by hitting this service directly (e.g. the
+            # provisioning-ready welcome email's magic link), as opposed to
+            # CONSOLE_URL which points at the frontend SPA.
+            - name: BACKEND_PUBLIC_URL
+              value: "https://{{ required "backend.gateway.hostname is required" .Values.backend.gateway.hostname }}"
+            - name: KEYCLOAK_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: master-config
+                  key: user
+            - name: KEYCLOAK_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: master-config
+                  key: password
+            {{- if .Values.backend.smtp.enabled }}
+            - name: SMTP_HOST
+              value: "{{ .Values.backend.smtp.host }}"
+            - name: SMTP_PORT
+              value: "{{ .Values.backend.smtp.port }}"
+            - name: SMTP_SECURE
+              value: "{{ .Values.backend.smtp.secure }}"
+            - name: SMTP_USER
+              value: "{{ .Values.backend.smtp.user }}"
+            # From a Secret, never the spec (templates/backend-smtp-credentials.yaml).
+            - name: SMTP_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.backend.smtp.existingSecret | default (printf "%s-smtp-credentials" (include "kube-dc.backend.fullname" .)) | quote }}
+                  key: {{ .Values.backend.smtp.existingSecretKey | default "password" | quote }}
+            - name: SMTP_FROM
+              value: "{{ .Values.backend.smtp.from }}"
+            - name: SMTP_FROM_NAME
+              value: "{{ .Values.backend.smtp.fromName }}"
+            {{- end }}
+            {{- if ne .Values.billing.provider "none" }}
+            - name: BILLING_PROVIDER
+              value: "{{ .Values.billing.provider }}"
+            {{- end }}
+            {{- if $billingURL }}
+            {{- /*
+            How the backend reaches the billing service, which is the only
+            writer of an OrganizationBillingPolicy (ADR-001 D8). Rendered only
+            on a PAYG installation (billing.payg.enabled). Its presence is
+            what registers the admin policy/hold/settlement/rate-card routes
+            and the tenant quote and budget routes, and what /system/features
+            and the admin console report as `payg`; without it none exist.
+
+            The token is PROJECTED with the service's own audience, so it
+            cannot be replayed against the Kubernetes API or any other
+            audience-checking service. The billing API refuses a token minted
+            for anything else.
+            */}}
+            - name: BILLING_SERVICE_URL
+              value: {{ $billingURL | quote }}
+            - name: BILLING_SERVICE_TOKEN_FILE
+              value: /var/run/secrets/billing/token
+            - name: BILLING_SERVICE_CA_FILE
+              value: /etc/kube-dc/billing-ca/ca.crt
+            {{- end }}
+            {{- with $selfService }}
+            {{- if and .enabled $payg }}
+            {{- /*
+            Self-service PAYG at signup. Only rendered when an operator turns
+            it on: a PAYG organization carries no plan annotation, so one whose
+            policy is not enforced has NO quota at all, and the registration
+            path refuses rather than create one. See
+            ui/backend/util/paygSelfService.js.
+            */}}
+            - name: PAYG_SELF_SERVICE_ENABLED
+              value: "true"
+            - name: PAYG_SELF_SERVICE_REQUIRE_CARD
+              value: {{ .requireCardValidation | quote }}
+            {{- with .cardValidationProvider }}
+            - name: PAYG_CARD_VALIDATION_PROVIDER
+              value: {{ . | quote }}
+            {{- end }}
+            - name: PAYG_SELF_SERVICE_COLLECTION_MODE
+              value: {{ .collectionMode | quote }}
+            {{- with .rateCardRevision }}
+            - name: PAYG_SELF_SERVICE_RATE_CARD
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .limits }}
+            - name: PAYG_SELF_SERVICE_LIMITS
+              value: {{ toJson .limits | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if eq .Values.billing.provider "stripe" }}
+            - name: STRIPE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.billing.stripe.secretName }}
+                  key: STRIPE_SECRET_KEY
+            - name: STRIPE_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.billing.stripe.secretName }}
+                  key: STRIPE_WEBHOOK_SECRET
+            - name: STRIPE_PRICE_DEV_POOL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.billing.stripe.secretName }}
+                  key: STRIPE_PRICE_DEV_POOL
+            - name: STRIPE_PRICE_PRO_POOL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.billing.stripe.secretName }}
+                  key: STRIPE_PRICE_PRO_POOL
+            - name: STRIPE_PRICE_SCALE_POOL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.billing.stripe.secretName }}
+                  key: STRIPE_PRICE_SCALE_POOL
+            - name: STRIPE_PRICE_TURBO_X1
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.billing.stripe.secretName }}
+                  key: STRIPE_PRICE_TURBO_X1
+            - name: STRIPE_PRICE_TURBO_X2
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.billing.stripe.secretName }}
+                  key: STRIPE_PRICE_TURBO_X2
+            {{- end }}
+            {{- if or (eq .Values.billing.provider "whmcs") (eq .Values.billing.provider "dual") }}
+            - name: WHMCS_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: whmcs-credentials
+                  key: webhook-secret
+            {{- end }}
+            # Public-projects gate (see kube-dc/docs/prd/public-projects-gate.md).
+            # The backend uses this to gate the egressNetworkType=public
+            # option in the project-create form. The manager-side
+            # ValidatingWebhook also reads `allow_public_projects` directly
+            # from the master-config Secret it loads via ConfigGlobal —
+            # this env is purely the UI's view of the same source of truth.
+            #
+            # NOT gated on .Values.manager.openBao.enabled — every cluster
+            # needs the UI feature flag whether or not OpenBao is in use.
+            # `optional: true` covers the bootstrap window before the
+            # chart re-renders the master-config Secret to include the
+            # new key.
+            - name: ALLOW_PUBLIC_PROJECTS
+              valueFrom:
+                secretKeyRef:
+                  name: master-config
+                  key: allow_public_projects
+                  optional: true
+            # Tenant-VLAN attachment. The UI must be ABSENT, not disabled, on a
+            # cluster that has not enabled it, so the frontend needs the same
+            # value the manager reads. Taken straight from the chart value
+            # rather than master-config: this is the switch that decides whether
+            # the manager publishes NADs at all, so the two cannot drift.
+            - name: PROJECT_NETWORK_ENABLED
+              value: {{ .Values.projectNetwork.enabled | quote }}
+            - name: ROUTED_NETWORK_ENABLED
+              value: {{ .Values.routedNetwork.enabled | quote }}
+            # Per-project VPC CIDR suggestion (see values.yaml backend.projectCidr).
+            # `reserved` must name every underlay inside `pool` that is not a
+            # project network, otherwise the allocator can suggest a block that
+            # overlaps node/management/VLAN ranges.
+            {{- with .Values.backend.projectCidr }}
+            - name: PROJECT_CIDR_POOL
+              value: {{ .pool | quote }}
+            - name: PROJECT_CIDR_PREFIX
+              value: {{ .prefix | quote }}
+            - name: PROJECT_CIDR_RESERVED
+              value: {{ join "," .reserved | quote }}
+            {{- end }}
+            {{- if and .Values.manager.openBao .Values.manager.openBao.enabled }}
+            # M1-T04: backend exchanges users' Keycloak JWTs against
+            # the per-Org auth/oidc-keycloak OpenBao mount. Same URL
+            # the manager reads from master-config; surfaced as env so
+            # the Node.js Vault client doesn't need the secret mount.
+            - name: OPENBAO_URL
+              valueFrom:
+                secretKeyRef:
+                  name: master-config
+                  key: openbao_url
+            # M1-T05: structured audit events for every /api/secrets/*
+            # call ship to this Loki push endpoint under the configured
+            # tenant (X-Scope-OrgID), per dev-scope §5. Default points
+            # at the in-cluster loki-gateway; leave empty (or unset
+            # backend.audit.lokiPushUrl) to disable audit emission
+            # without breaking the rest of the secrets API.
+            - name: LOKI_PUSH_URL
+              value: "{{ .Values.backend.audit.lokiPushUrl | default "http://loki-gateway.monitoring.svc:80" }}"
+            # M1-T05b: audit query endpoints (/api/audit/*) read from
+            # this URL. Defaults to the push URL when not separately
+            # set so push and query stay in lock-step when an operator
+            # customises one of them.
+            - name: LOKI_QUERY_URL
+              value: "{{ .Values.backend.audit.lokiQueryUrl | default .Values.backend.audit.lokiPushUrl | default "http://loki-gateway.monitoring.svc:80" }}"
+            - name: LOKI_AUDIT_TENANT
+              value: "{{ .Values.backend.audit.tenant | default "system" }}"
+            {{- end }}
+            {{- if .Values.backend.keycloakAdminClient.secretName }}
+            # Admin Console pages that read Keycloak (Platform Admins, Auth &
+            # SSO) use a client_credentials grant, NOT the admin user/password
+            # above. Without these the pages report "Keycloak admin client not
+            # configured" and Auth & SSO shows 0 realms on a populated cluster.
+            # `kube-dc bootstrap keycloak init` creates the client
+            # (kube-dc-admin-backend, confidential + service account).
+            - name: KEYCLOAK_ADMIN_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.backend.keycloakAdminClient.secretName | quote }}
+                  key: {{ .Values.backend.keycloakAdminClient.clientIdKey | quote }}
+            - name: KEYCLOAK_ADMIN_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.backend.keycloakAdminClient.secretName | quote }}
+                  key: {{ .Values.backend.keycloakAdminClient.clientSecretKey | quote }}
+            {{- end }}
+            # Outbound TLS verification. OFF by default and deliberately so:
+            # it can only succeed once the trust bundle covers every host this
+            # backend calls — the API server (cluster CA, added by
+            # docker-entrypoint.sh) and the platform's own HTTPS endpoints
+            # (backend.trustedCA below, when they use a private CA). A cluster
+            # that reaches the API server by an address its certificate does not
+            # cover would fail every call the moment this flipped, so it is
+            # proven per installation and then enabled.
+            #
+            # Independent of this, the tenant-VLAN authorization path always
+            # verifies — see ui/backend/util/k8sVerifiedRequest.js.
+            - name: BACKEND_TLS_VERIFY
+              value: {{ .Values.backend.tlsVerify | default false | quote }}
+            # Default-deny authentication for /api (ui/backend/util/apiAuthentication.js):
+            # report logs what it would refuse, enforce answers 401, off skips it.
+            - name: API_AUTH_MODE
+              value: {{ .Values.backend.authMode | default "report" | quote }}
+            {{- if .Values.backend.trustedCA.configMapName }}
+            # Node does NOT read SSL_CERT_DIR (the manager's mechanism). It reads
+            # NODE_EXTRA_CA_CERTS — a single FILE, appended to the bundled roots,
+            # so public CAs keep working. Required when the platform's own HTTPS
+            # endpoints use a private CA, otherwise every server-side call the
+            # backend makes fails with "certificate verify failed".
+            - name: NODE_EXTRA_CA_CERTS
+              value: {{ printf "%s/%s" (trimSuffix "/" .Values.backend.trustedCA.mountPath) .Values.backend.trustedCA.fileName | quote }}
+            {{- end }}
+          {{- with .Values.backend.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if $isWorker }}
+          {{- with $worker.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml ($worker.resources | default dict) | nindent 12 }}
+          {{- else }}
+          {{- with .Values.backend.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.backend.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.backend.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.backend.resources | nindent 12 }}
+          {{- end }}
+          {{- if or .Values.backend.volumeMounts .Values.backend.trustedCA.configMapName (.Values.backend.cliDiscovery | default dict).caConfigMapName $billingURL }}
+          volumeMounts:
+            {{- if $billingURL }}
+            - name: billing-token
+              mountPath: /var/run/secrets/billing
+              readOnly: true
+            - name: billing-ca
+              mountPath: /etc/kube-dc/billing-ca
+              readOnly: true
+            {{- end }}
+            {{- if (.Values.backend.cliDiscovery | default dict).caConfigMapName }}
+            - name: cli-api-ca
+              mountPath: /etc/kube-dc/api-ca
+              readOnly: true
+            {{- end }}
+            {{- if .Values.backend.trustedCA.configMapName }}
+            - name: trusted-ca
+              mountPath: {{ .Values.backend.trustedCA.mountPath | quote }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.backend.volumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+      {{- if or .Values.backend.volumes .Values.backend.trustedCA.configMapName (.Values.backend.cliDiscovery | default dict).caConfigMapName $billingURL }}
+      volumes:
+        {{- if $billingURL }}
+        - name: billing-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: {{ $billingService.audience | default "kube-dc-billing" | quote }}
+                  expirationSeconds: 3600
+        - name: billing-ca
+          secret:
+            {{- if $billingIssuer }}
+            {{- /* cert-manager mints it here and renews it with the CA. */}}
+            secretName: {{ include "kube-dc.backend.fullname" . }}-billing-ca
+            items:
+              - key: ca.crt
+                path: ca.crt
+            {{- else }}
+            secretName: {{ required "billing.service needs either caIssuer.name or caSecretName when url is set: the backend cannot verify the billing service without its CA" $billingService.caSecretName | quote }}
+            items:
+              - key: {{ $billingService.caKey | default "ca.crt" | quote }}
+                path: ca.crt
+            {{- end }}
+        {{- end }}
+        {{- if (.Values.backend.cliDiscovery | default dict).caConfigMapName }}
+        - name: cli-api-ca
+          configMap:
+            name: {{ .Values.backend.cliDiscovery.caConfigMapName | quote }}
+            items:
+              - key: {{ .Values.backend.cliDiscovery.caKey | default "ca.crt" | quote }}
+                path: ca.crt
+        {{- end }}
+        {{- if .Values.backend.trustedCA.configMapName }}
+        - name: trusted-ca
+          configMap:
+            name: {{ .Values.backend.trustedCA.configMapName | quote }}
+        {{- end }}
+        {{- with .Values.backend.volumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.backend.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.backend.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.backend.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- end }}

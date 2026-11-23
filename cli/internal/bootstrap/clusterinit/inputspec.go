@@ -1,0 +1,184 @@
+package clusterinit
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"unicode"
+)
+
+// A saved install spec restores deliberate overrides. An unmarked cluster
+// environment remains a clone source: site addresses and release pins are
+// filtered so they cannot silently become another cluster's configuration.
+const KeySpecVersion = InitPrefix + "SPEC_VERSION"
+const InputSpecVersion = "1"
+
+type inputStringBinding struct {
+	key, flag string
+	field     func(*InitOptions) *string
+}
+
+// Only artifact references and file paths are stored here. Credential contents and approval flags are
+// never part of a reusable environment file.
+var inputStringBindings = []inputStringBinding{
+	{InitPrefix + "INSTALLATION_KIND", "installation-kind", func(o *InitOptions) *string { return &o.InstallationKind }},
+	{InitPrefix + "MANAGED_SERVICES", "managed-services", func(o *InitOptions) *string { return &o.ManagedServicesMode }},
+	{InitPrefix + "SERVICES_DATABASE_CLASS", "services-database-class", func(o *InitOptions) *string { return &o.ServicesDatabaseClass }},
+	{InitPrefix + "SERVICES_HA_STORAGE_CLASS", "services-ha-storage-class", func(o *InitOptions) *string { return &o.ServicesHAStorageClass }},
+	{InitPrefix + "SERVICES_HA_STORAGE_BUDGET", "services-ha-storage-budget", func(o *InitOptions) *string { return &o.ServicesHAStorageBudget }},
+	{InitPrefix + "SERVICES_STORAGE_BUDGET", "services-storage-budget", func(o *InitOptions) *string { return &o.ServicesStorageBudget }},
+	{InitPrefix + "STARTER_REF", "starter-ref", func(o *InitOptions) *string { return &o.StarterRef }},
+	{InitPrefix + "TLS_CERT", "tls-cert", func(o *InitOptions) *string { return &o.TLSCert }},
+	{InitPrefix + "TLS_KEY", "tls-key", func(o *InitOptions) *string { return &o.TLSKey }},
+	{InitPrefix + "TRUSTED_CA_BUNDLE", "trusted-ca-bundle", func(o *InitOptions) *string { return &o.TrustedCABundle }},
+	{InitPrefix + "SITE_COMPONENTS", "site-components", func(o *InitOptions) *string { return &o.SiteComponents }},
+	{InitPrefix + "DNS01_ROUTE53_SECRET_KEY_FILE", "dns01-route53-secret-key-file", func(o *InitOptions) *string { return &o.DNS01Route53SecretKeyFile }},
+	{InitPrefix + "DNS01_CLOUDFLARE_API_TOKEN_FILE", "dns01-cloudflare-api-token-file", func(o *InitOptions) *string { return &o.DNS01CloudflareAPITokenFile }},
+}
+
+// RestoreRetainedInputs seeds a form from a complete input snapshot. Missing
+// reference fields clear earlier values; runtime credentials and approvals stay
+// outside this contract. The shared bindings include future file references.
+func RestoreRetainedInputs(o *InitOptions, snapshot map[string]string) {
+	values := make(map[string]string, len(snapshot)+len(inputStringBindings)+12)
+	for k, v := range snapshot {
+		values[k] = v
+	}
+	values[KeySpecVersion] = InputSpecVersion
+	for _, b := range inputStringBindings {
+		if _, exists := values[b.key]; !exists {
+			values[b.key] = ""
+		}
+	}
+	for _, k := range []string{"TLS_MODE", "DNS01_ROUTE53_ZONE_ID", "DNS01_ROUTE53_REGION", "DNS01_ROUTE53_ACCESS_KEY_ID", "DNS01_CLOUDFLARE_ZONE", "DNS01_CLOUDFLARE_SCOPE", "GPU_SHARED_ALLOCATOR", KeyVMGolden, KeyVMGoldenBlock, KeyPAYG} {
+		if _, exists := values[k]; !exists {
+			values[k] = ""
+		}
+	}
+	ImportMap(o, values, func(string) bool { return false })
+}
+
+// ValidateInputSpec checks the file format without requiring complete cluster
+// settings. Errors name keys, never values, because an invalid entry can carry
+// a credential. Files are parsed as data and are never sourced by a shell.
+func ValidateInputSpec(src map[string]string) error {
+	if v, ok := src[KeySpecVersion]; ok && v != InputSpecVersion {
+		return fmt.Errorf("unsupported %s; supported version is %s", KeySpecVersion, InputSpecVersion)
+	}
+	if err := validateCephInputs(src); err != nil {
+		return err
+	}
+	for _, k := range SpecOrderedKeys(src) {
+		v := src[k]
+		if !isUpperKey(k) {
+			return fmt.Errorf("configuration key must use uppercase letters, digits, and underscores")
+		}
+		if strings.IndexFunc(v, unicode.IsControl) >= 0 {
+			return fmt.Errorf("%s must contain one line without control characters", k)
+		}
+		if strings.HasPrefix(k, InitPrefix) && !IsOrchestrationKey(k) {
+			return fmt.Errorf("unknown installer setting %s", k)
+		}
+		if IsSecretConfigKey(k) && strings.TrimSpace(v) != "" {
+			return fmt.Errorf("%s contains credential material; use a credential file or encrypted Secret", k)
+		}
+		if credentialFileKeys[k] && looksLikeCredentialContents(v) {
+			return fmt.Errorf("%s must name a file, not contain its contents", k)
+		}
+		if err := validateKnownSetting(k, v); err != nil {
+			return err
+		}
+		switch k {
+		case KeyPrimaryNode:
+			if v != "" {
+				if err := ValidateK8sNodeNameField(v); err != nil {
+					return fmt.Errorf("%s must be a Kubernetes node name", k)
+				}
+			}
+		case KeyNodeSSHHosts:
+			pairs, err := ParseSetPairs(splitCSVList(v))
+			if err != nil || len(validateNodeSSHHosts("", pairs)) > 0 {
+				return fmt.Errorf("%s must contain valid NODE=SSH_HOST pairs", k)
+			}
+		case KeyNodeSSHHostKeys:
+			pairs, err := ParseSetPairs(splitCSVList(v))
+			if err != nil || len(validateNodeSSHHostKeys(pairs)) > 0 {
+				return fmt.Errorf("%s must contain valid NODE=SHA256:FINGERPRINT pairs", k)
+			}
+		case KeyNodeNICs:
+			if _, err := ParseSetPairs(splitCSVList(v)); err != nil {
+				return fmt.Errorf("%s must contain unique NODE=IFACE pairs", k)
+			}
+		case "GPU_NODE_MODES":
+			if _, err := ParseGPUNodeModes(splitCSVList(v)); err != nil {
+				return fmt.Errorf("%s must contain valid NODE=MODE pairs", k)
+			}
+		case "CEPH_LOCAL_OSD_SIZE_GB", "CEPH_OSD_COUNT", "CEPH_OSD_VOLUME_SIZE_GB":
+			if v != "" {
+				if _, err := strconv.Atoi(v); err != nil {
+					return fmt.Errorf("%s must be an integer", k)
+				}
+			}
+		case KeyAllowDNS, KeyAllowNoKVM, KeyAllowUnpin, KeyNoS3Exposure, KeyNoKubeVirt, KeyPAYG, KeyPAYGManagedFees, KeyGPUAllowUnassigned, KeyVGPUSecretReady, "HAMI_ENABLED", "GPU_ENABLED", "GPU_CATALOG_ENABLED":
+			switch strings.ToLower(v) {
+			case "", "true", "false", "1", "0", "yes", "no", "on", "off":
+			default:
+				return fmt.Errorf("%s must be a boolean", k)
+			}
+		}
+	}
+	return nil
+}
+
+// IsSecretConfigKey identifies credential values, not references or boolean
+// capability flags. Known installation path fields are explicitly allowed.
+func IsSecretConfigKey(k string) bool {
+	if IsOrchestrationKey(k) {
+		return false
+	}
+	for _, suffix := range []string{"_REF", "_NAME", "_ENABLED", "_READY", "_FILE"} {
+		if strings.HasSuffix(k, suffix) {
+			return false
+		}
+	}
+	return strings.Contains(k, "PASSWORD") || strings.HasSuffix(k, "_TOKEN") ||
+		strings.HasSuffix(k, "_SECRET") || strings.HasSuffix(k, "_SECRET_KEY") ||
+		strings.HasSuffix(k, "_SECRET_ACCESS_KEY") || strings.HasSuffix(k, "_PRIVATE_KEY") ||
+		strings.HasPrefix(k, "OPENBAO_UNSEAL_KEY_")
+}
+
+// credentialFileKeys name a file holding a certificate, key or token. The
+// value is a path; a pasted credential would be shown, saved and committed.
+var credentialFileKeys = map[string]bool{
+	InitPrefix + "TLS_CERT":                        true,
+	InitPrefix + "TLS_KEY":                         true,
+	InitPrefix + "TRUSTED_CA_BUNDLE":               true,
+	InitPrefix + "DNS01_ROUTE53_SECRET_KEY_FILE":   true,
+	InitPrefix + "DNS01_CLOUDFLARE_API_TOKEN_FILE": true,
+}
+
+// IsCredentialFileKey reports a key whose value names a credential file.
+func IsCredentialFileKey(k string) bool { return credentialFileKeys[k] }
+
+// looksLikeCredentialContents refuses a value that is not an existing file
+// and carries a strong credential signal: PEM text, whitespace, base64
+// padding characters, or a long bare token (no directory separator and no
+// file extension). An existing regular file is always accepted, whatever its
+// name. The panel goes further and accepts only existing files.
+func looksLikeCredentialContents(v string) bool {
+	v = strings.TrimSpace(v)
+	if v == "" || IsExistingRegularFile(v) {
+		return false
+	}
+	if strings.Contains(v, "-----BEGIN") || strings.ContainsAny(v, " \t+=") {
+		return true
+	}
+	return !strings.ContainsAny(v, "/.") && len(v) >= 20
+}
+
+// IsExistingRegularFile reports a path naming a regular file on this machine.
+func IsExistingRegularFile(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.Mode().IsRegular()
+}

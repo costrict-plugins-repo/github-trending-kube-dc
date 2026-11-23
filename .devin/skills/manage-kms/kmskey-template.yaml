@@ -1,0 +1,23 @@
+apiVersion: security.kube-dc.com/v1alpha1
+kind: KMSKey
+metadata:
+  name: "{key-name}"
+  namespace: "{backing-namespace}"
+spec:
+  # application: tenant payloads
+  # etcd: Managed Cluster encryption; normally auto-managed
+  # backup: backup-envelope key
+  purpose: application
+
+  algorithm: aes256-gcm96 # aes256-gcm96 | chacha20-poly1305
+
+  # retain preserves Transit material if the Kubernetes resource is deleted.
+  # Use the admin-only CLI flow to schedule/cancel destruction.
+  deletionPolicy: retain
+
+  rotation:
+    enabled: true
+    interval: 90d
+
+  # Key material is never exportable.
+  exportable: false

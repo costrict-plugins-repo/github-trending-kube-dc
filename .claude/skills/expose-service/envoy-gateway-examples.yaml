@@ -1,0 +1,53 @@
+# HTTPS: Gateway terminates TLS and forwards HTTP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: "{service-name}"
+  namespace: "{backing-namespace}"
+  annotations:
+    service.nlb.kube-dc.com/expose-route: "https"
+    service.nlb.kube-dc.com/route-port: "8080"
+spec:
+  type: ClusterIP
+  selector:
+    app: "{application-label}"
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+---
+# HTTPS with an explicit hostname. Configure DNS for custom domains.
+apiVersion: v1
+kind: Service
+metadata:
+  name: "{service-name}-custom"
+  namespace: "{backing-namespace}"
+  annotations:
+    service.nlb.kube-dc.com/expose-route: "https"
+    service.nlb.kube-dc.com/route-hostname: "app.example.com"
+spec:
+  type: ClusterIP
+  selector:
+    app: "{application-label}"
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+---
+# TLS passthrough: the backend must terminate TLS and present a certificate
+# valid for the public SNI hostname.
+apiVersion: v1
+kind: Service
+metadata:
+  name: "{service-name}-tls"
+  namespace: "{backing-namespace}"
+  annotations:
+    service.nlb.kube-dc.com/expose-route: "tls-passthrough"
+spec:
+  type: ClusterIP
+  selector:
+    app: "{application-label}"
+  ports:
+  - name: tls
+    port: 443
+    targetPort: 8443

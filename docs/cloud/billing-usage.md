@@ -1,0 +1,499 @@
+# Billing and usage
+
+The **Billing & quotas** page lets you monitor resource consumption, manage your subscription plan, add extra capacity, and control payment for your whole Organization. To open it, select **Manage organization** in the account menu, then open **Billing & quotas**.
+
+## Pay-as-you-go organizations
+
+Your provider chooses whether your Organization uses a fixed subscription or
+pay-as-you-go (PAYG). For a PAYG Organization, open **Project > Quota** to see
+month-to-date estimated spending alongside resource usage. The estimate shows
+the selected Project and Organization totals, daily spending, measured
+quantities and applicable unit prices. Daily bars split the observed cost into
+its largest products and an **Other** group. **What costs the most** ranks every
+observed product for the selected Project; its percentages describe cost, while
+the resource bars describe the Project's share of Organization consumption.
+
+On a billable rate card, the preview includes recorded compute, block storage,
+object storage, retained backups, logs, metrics and managed-service management
+fees when used. It reads elected charge quantities rather than overlapping
+collector diagnostics. The whole-hour cutoff is a query boundary: evidence
+from some sources can arrive later. The preview remains an incomplete subtotal. The statement separately applies
+the account's billing dates, coverage rules and adjustments.
+A missing observation is unknown, not a zero-cost interval.
+
+An estimate is not an invoice. **Measuring only — not charged** means billing
+is still in observation mode. A total marked **≥** includes only observed
+intervals; gaps are unknown. **Measured, not priced** means that quantity has
+no applicable price on the displayed card. Ask your provider about billing
+activation or an incomplete estimate.
+
+### Payment method and invoice history
+
+An organization administrator manages the payment method for the whole
+Organization in **Manage organization > Billing & quotas**. Projects share
+that billing account. Platform administrators configure prices and billing
+policy; the paying Organization adds its own card.
+
+On installations with Stripe payments enabled:
+
+1. Open **Payment method** to check whether a default payment method is on
+   file. When available, the console shows the card's brand, last four digits,
+   and expiry date. If details are unavailable, open Stripe to inspect them.
+2. Select **Add payment method** or **Manage payment method**. Enter card
+   details on Stripe's secure page, then return to the console and select
+   **Refresh payment method**. Use a real card accepted by Stripe on a live
+   installation; Stripe test cards work only in test mode.
+3. Open **Invoices** to see issued PAYG invoices, payment status, totals, and
+   remaining balances. Select **View / pay** to open an unpaid invoice, or
+   **PDF** to download its document. A partially paid invoice shows its
+   remaining balance. No history appears until an invoice has been issued.
+
+Open **Billing periods** to inspect current and previous statement periods.
+**Statement prepared** means the statement is ready for the billing workflow;
+**Invoice issued** means an invoice reference exists. Only an invoice marked
+**Paid** confirms payment. Periods and dates use UTC.
+
+In **Project usage**, select **Usage month** to inspect the current month or
+one of the previous twelve months. **View usage estimate** on a period opens
+that month's estimate. These estimates use current list prices and can be
+incomplete; the issued invoice contains the final charges. Older periods
+remain accessible through paginated history even after their detailed usage
+is no longer retained.
+
+### Managed-service fees and resources
+
+A managed service has two parts to its PAYG cost:
+
+- **Management:** one configured plan fee per logical service for the time
+  management is active. More replicas, larger Pods or more storage do not
+  multiply this fee. Changing the management plan can change its price.
+- **Resources:** dedicated CPU, memory, block storage and other metered usage
+  are charged at their applicable rates. Service-created Pods and volumes in
+  your Project count here. Shared platform infrastructure is covered by the
+  management fee.
+
+Increasing capacity within the same management plan increases resource cost;
+the management rate stays the same. Retained volumes or backups can continue
+to incur storage charges after management stops, until that retained data is
+removed.
+
+Prices labeled per **730 hours** use a reference month. For example, a
+management rate of €5 per 730 hours costs €5 × 30 ÷ 730, or approximately
+€0.21, for 30 eligible hours, plus resource usage. The total for a calendar
+month depends on how long the service is managed during that month. Use the
+prices shown for your installation.
+
+[Service offerings](service-offerings.md) list a plan's defaults and limits,
+not its prices.
+
+### Monetary precision
+
+Metering keeps quantities and prices at sufficient precision to accumulate
+small charges. The approved statement rounds its net total to cents and
+allocates those cents across its lines so they add up exactly. Individual
+observations are not each rounded to a cent. The displayed month-to-date
+estimate can change as additional usage arrives and the period is reconciled.
+
+The subscription plans and add-ons below apply to fixed-plan Organizations.
+
+## Billing overview
+
+The **Billing & quotas** page shows your subscription, your resource usage,
+and three tabs: **Project usage**, **Plans**, and **Add-ons**. It shows:
+
+- **Subscription**: the active plan and its cost
+- **Active add-ons**: the add-on packages applied to the organization
+- **Resource usage**: a usage bar for every quota dimension:
+  - CPU (cores used / total available)
+  - Memory (GiB used / total available)
+  - Block storage (GiB used / total available)
+  - Pods (count used / plan limit)
+  - Public IPv4 (addresses used / plan limit)
+  - Object Storage (GB used / plan limit)
+
+The progress bars change color as usage rises: green → yellow → red. A resource shown in red is at or near its limit and may block new deployments.
+
+From this page you can also:
+
+- open the **Plans** tab to browse and switch subscription plans;
+- open the **Add-ons** tab to add or remove capacity packages;
+- click **Payment & invoices** to update billing details with the billing provider.
+
+---
+
+## Subscription plans
+
+Your provider defines the plans, their prices, and the CPU, memory, storage,
+pod, and public IPv4 quota each plan includes. To see them, open the **Plans**
+tab on the **Billing & quotas** page. The console is the source of truth for
+plan names, prices, and entitlements. Features marked
+Preview, Pilot, or provider-specific in the console may require a separate
+entitlement.
+
+### Plans with a GPU
+
+Some installations offer a **GPU alternative for each tier**. When they do, the
+plan grid shows a **Standard / With GPU** switch: the tiers are otherwise
+identical, with the same CPU, memory, storage, IPv4, and pod limits. The GPU version
+adds a shared GPU allocation to the same tier.
+
+A GPU plan lists what it includes:
+
+| | Meaning |
+|---|---|
+| **Concurrent GPU workloads** | How many GPU workloads can run at the same time |
+| **GPU memory** | Total GPU memory reserved across those workloads |
+| **GPU compute** | Total share of GPU compute across those workloads |
+
+:::note GPU quota is an entitlement, not a reservation
+Your plan entitles you to run that much GPU at once. It does not hold a physical
+GPU aside for you: if every matching GPU is busy, a new GPU workload waits in the
+queue until one frees up.
+:::
+
+If you do not see the switch, this installation does not sell GPU as part of a
+plan. A GPU can still be available as an add-on. Check the **Add-ons** section of
+your Billing page, or ask your provider.
+
+:::tip Plan with measurements
+Use the [Scaling and Performance Guide](scaling-performance.md) to define a
+latency target, load-test the complete application, configure autoscaling, and
+reserve rollout and recovery headroom. Generic user-count estimates are not a
+capacity guarantee.
+:::
+
+---
+
+## Understand resource quotas
+
+All resources in your plan are **shared across all projects** in your organization. The quota is applied at the organization level, and any combination of usage across your projects counts toward it.
+
+**Example:** Organization `acme` has a plan with 8 vCPU and 24 GiB, shared by
+Projects `development`, `staging`, and `production`:
+
+| Project | Backing namespace | CPU used | Memory used |
+|---|---|---:|---:|
+| `development` | `acme-development` | 2 vCPU | 4 GiB |
+| `staging` | `acme-staging` | 2 vCPU | 8 GiB |
+| `production` | `acme-production` | 3 vCPU | 10 GiB |
+| **Total** | | **7 vCPU** | **22 GiB** |
+
+The Organization still has 1 vCPU and 2 GiB available.
+
+There is no per-Project quota split by default. Projects draw from the same shared pool. If one Project is idle, another can use all available resources. Organization admins can optionally set per-Project limits to prevent one Project from consuming everything; see [Per-Project resource limits](#per-project-resource-limits).
+
+The **Public IPv4** dimension counts only `EIp` resources with `externalNetworkType: public` across the Organization namespace and all Project backing namespaces. Cloud/private External IPs do not consume this public-address quota. A Floating IP that automatically creates a public `EIp` consumes one slot through that `EIp`.
+
+### Guaranteed capacity
+
+Your provider sets an allocation ratio for each plan. With a ratio of 1.0, the
+CPU and memory shown in the plan are the organization quota, not a smaller
+reservation backed by a burst multiplier. Scheduling still depends on
+available cluster capacity.
+
+:::info
+Use the Billing page for the effective quota on your organization. Do not plan
+capacity around temporary usage above that value.
+:::
+
+---
+
+## Resource limits for workloads
+
+Kubernetes enforces organization quota from workload resource requests and
+limits. When a container omits them, the Project's LimitRange applies your
+plan's defaults.
+
+### Automatic defaults
+
+**You do not need to manually set resource values on every workload.** The platform automatically applies default CPU and memory values to any container that doesn't specify them. Your provider sets these defaults for each plan. They cover the default CPU and memory request, the default CPU and memory limit, and the maximum CPU and memory for each container and each pod.
+
+To see the values for your plan, read the `default-resource-limits` LimitRange
+in a Project backing namespace:
+
+```bash
+kubectl get limitrange default-resource-limits -n <organization>-<project> -o yaml
+```
+
+Replace `<organization>` with your Organization ID and `<project>` with your Project
+name.
+
+**Requests** reserve schedulable capacity. **Limits** cap runtime use: CPU is
+throttled, while exceeding a memory limit can terminate the container for OOM.
+
+### What this means in practice
+
+- A pod deployed without any resource declarations (for example, a raw Kubernetes deployment with no `resources:` block) will automatically receive the plan's default request and limit values.
+- KubeVirt virtual machines translate their vCPU and memory settings into pod-level resource values automatically. You configure nothing by hand.
+- The **max per container** cap prevents a single runaway container from consuming your entire organization's quota. If you need a container larger than the plan's max, contact support or upgrade to a higher plan.
+
+### When workloads are rejected
+
+After your organization's quota is fully consumed, new workloads will fail to start with an error such as:
+
+```
+Error from server (Forbidden): pods "api" is forbidden: exceeded quota: plan-quota, requested: requests.cpu=500m, used: requests.cpu=8, limited: requests.cpu=8
+```
+
+To resolve this:
+- Delete unused pods or VMs to free quota
+- Add an add-on package to expand capacity
+- Upgrade to a higher plan
+
+---
+
+## Add-ons
+
+Add-ons increase your organization's resources without switching plans. Add-ons apply to your **whole Organization**, and they stack. You can add the same package more than once.
+
+Your provider defines the add-on packages, their prices, and the capacity each
+one adds. To see them, open the **Add-ons** tab on the **Billing & quotas**
+page.
+
+### Add an add-on
+
+1. Open **Manage organization**, then **Billing & quotas**, then the
+   **Add-ons** tab.
+2. Click **Add capacity** on the package.
+3. Wait for the billing provider to confirm the purchase and for the updated
+   quota to appear on the **Billing & quotas** page.
+
+### Remove an add-on
+
+1. Open **Manage organization**, then **Billing & quotas**, then the
+   **Add-ons** tab.
+2. Click **Remove one** on the package you want to reduce.
+3. Click **Confirm change**.
+
+:::warning Downgrade Check
+Before removing an add-on, ensure your current resource usage fits within the reduced quota. If active workloads exceed the new limit, they will continue running but no new workloads will be schedulable until usage drops below the new quota.
+:::
+
+---
+
+## Manage your subscription
+
+### Subscribe to a plan
+
+1. Open **Manage organization**, then **Billing & quotas**, then the
+   **Plans** tab.
+2. Click **Choose plan** on the plan you want.
+3. Click **Confirm plan**, then complete checkout with the billing provider of
+   your installation.
+4. Return to **Billing & quotas** and wait until the subscription shows
+   **Active** before you deploy.
+
+### Change your plan
+
+You can upgrade or downgrade at any time from the **Plans** tab:
+
+1. Click **Review plan change** on the target plan.
+2. Click **Confirm plan**.
+
+**On upgrade:** Quota is updated after the billing provider confirms the
+change. Any proration is shown during checkout or in the provider portal.
+
+**On downgrade:** The system checks whether your current resource usage fits within the new plan before allowing the change. If you are over the target plan's limits, you will need to scale down workloads first.
+
+### Cancel your subscription
+
+1. Open **Manage organization**, then **Billing & quotas**.
+2. In the **Subscription** panel, click **Cancel subscription**.
+3. Click **Confirm change**.
+
+The cancellation date and any proration depend on the configured billing
+provider. The console shows the effective date and subscription state. While
+the subscription remains `canceling`, its quota stays available until the
+provider confirms the terminal state.
+
+---
+
+## Subscription status
+
+| Status | Resources | New Deployments | Payment |
+|--------|-----------|-----------------|---------|
+| **Active** | Full plan quota | ✅ Allowed | Current |
+| **Trialing** | Full plan quota | ✅ Allowed | Trial period |
+| **Canceling** | Full plan quota | ✅ Allowed | Until period ends |
+| **Suspended** | Minimal only | ❌ Blocked | Payment failed |
+| **Canceled** | Minimal only, workloads paused | ❌ Blocked | Expired |
+
+### What happens when a subscription is suspended
+
+If a payment fails, the subscription moves to `suspended`:
+
+1. **7-day grace period**: all existing workloads continue running, but new deployments are blocked
+2. **After 7 days**: if payment is still not resolved:
+   - All Deployments and StatefulSets are scaled to zero replicas
+   - CronJobs are suspended
+   - The organization quota drops to a minimal holding allocation
+
+Original replica counts are saved and restored automatically when you re-subscribe.
+
+### Re-subscribing
+
+If your subscription is suspended or canceled, click **Choose plan** on the **Plans** tab to start a new subscription. All previously running workloads are automatically restored to their original state.
+
+---
+
+## Manage payment
+
+In the **Subscription** panel on **Billing & quotas**, click **Payment &
+invoices** to open the payment portal of your installation. The button appears
+only when the billing provider offers a portal. Available actions depend on that provider and
+can include:
+
+- **Update payment method**: Change credit card or SEPA details
+- **Download invoices**: Access billing history and PDF receipts
+- **View upcoming charges**: Preview the next billing cycle
+- **Update billing address**: Change the address shown on invoices
+
+Use the provider's **Return** action to come back to the Kube-DC console.
+
+---
+
+## Per-Project resource limits
+
+By default, all projects share the organization quota with no individual caps. Organization administrators can optionally cap individual projects to prevent a single project from consuming the entire budget.
+
+### Set limits in the console
+
+1. Open **Manage organization**, then **Projects**.
+2. Click the Project you want to limit, then open its **Quotas** tab.
+3. Click **Edit limits**.
+4. Enter values for **CPU (cores)**, **Memory**, **Storage**, or **Pods**, and
+   click **Save limits**. An empty field keeps the organization pool.
+
+The **Project resource limits** panel on the same tab shows the Project's caps next to the organization quota.
+
+### How limits are applied
+
+The effective limit for a resource is the lower of the Project cap and the
+organization's remaining quota. To return the Project to the shared
+organization pool, click **Use organization pool** on its **Quotas** tab.
+
+Project `ResourceQuota` objects are platform-managed and read-only through a
+Project kubeconfig. Do not create, patch, or delete `project-quota` directly;
+the organization-admin UI validates the requested values and applies them
+through the platform service.
+
+---
+
+## Track usage with kubectl
+
+The platform exposes resource usage directly on the `Organization` and `Project` custom resources so you can query quota state from the command line without logging into the UI. Usage updates are asynchronous. Organization quota is event-driven; Project
+quota also reacts to `ResourceQuota` changes and has a periodic 5–7 minute
+fallback. Check each resource status timestamp before comparing values.
+
+### Organization-level usage
+
+```bash
+# Full quota summary (human-readable)
+kubectl get organization <organization> -n <organization> -o jsonpath='{.status.quotaUsage}' | jq .
+```
+
+Example output:
+
+```json
+{
+  "cpu":           { "used": "18.975", "hard": "26" },
+  "memory":        { "used": "63.6Gi", "hard": "70Gi" },
+  "storage":       { "used": "443.2Gi", "hard": "460Gi" },
+  "pods":          { "used": "33",     "hard": "500" },
+  "publicIPv4":    { "used": "3",      "hard": "3" },
+  "objectStorage": { "used": "",       "hard": "500Gi" },
+  "lastUpdated":   "2026-04-07T20:55:42Z"
+}
+```
+
+- **cpu**: cores used / available (decimal, for example, `18.975` = 18,975 millicores)
+- **memory** and **storage**: the GiB consumed, against the plan limit
+- **publicIPv4**: count of public External IPs in use across all projects
+- **objectStorage**: hard limit from plan; `used` is populated asynchronously from object storage stats
+- **lastUpdated**: timestamp of last controller refresh
+
+Check a single field:
+
+```bash
+kubectl get organization <organization> -n <organization> -o jsonpath='{.status.quotaUsage.cpu}' | jq .
+# → { "hard": "26", "used": "18.975" }
+```
+
+### Project-level usage
+
+Each Project reports usage for its backing namespace:
+
+```bash
+kubectl get project <project> -n <organization> -o jsonpath='{.status.quotaUsage}' | jq .
+```
+
+Example output:
+
+```json
+{
+  "cpu":               { "used": "6.72",    "hard": "26" },
+  "memory":            { "used": "16.824Gi","hard": "70Gi" },
+  "storage":           { "used": "147.4Gi", "hard": "460Gi" },
+  "pods":              { "used": "12",      "hard": "500" },
+  "perProjectQuotaSet": false,
+  "lastUpdated":       "2026-04-07T20:55:00Z"
+}
+```
+
+- **hard** shows the organization limit when no `project-quota` exists. When one is configured, each classic dimension shows only its explicit per-project cap; an omitted dimension remains pooled and is not presented as a project cap
+- **perProjectQuotaSet**: `true` if an admin has applied an explicit per-project `ResourceQuota`
+
+### All projects at a glance
+
+```bash
+# Print Project name and CPU used/hard for all Projects in an Organization
+kubectl get projects -n <organization> \
+  -o custom-columns='PROJECT:.metadata.name,CPU_USED:.status.quotaUsage.cpu.used,CPU_HARD:.status.quotaUsage.cpu.hard,MEM_USED:.status.quotaUsage.memory.used'
+```
+
+### Raw ResourceQuota (live Kubernetes enforcement)
+
+The `quotaUsage` status is a controller summary refreshed every few minutes. For real-time enforcement state, query the underlying `ResourceQuota` objects directly:
+
+```bash
+# All quotas in a Project backing namespace
+kubectl get resourcequota -n acme-production
+
+# Detailed usage breakdown
+kubectl describe resourcequota -n acme-production
+```
+
+The `hrq.hnc.x-k8s.io` quota is the organization-wide HNC propagated limit. The `project-quota` quota (if present) is the per-project cap set by an admin.
+
+---
+
+## Troubleshooting
+
+**New pods or VMs fail to start with "exceeded quota"**
+- Check **Resource usage** on **Billing & quotas** for the resource at its limit, or run:
+  ```bash
+  kubectl get organization <organization> -n <organization> -o jsonpath='{.status.quotaUsage}' | jq .
+  ```
+- Delete unused workloads to free capacity, or add an add-on package
+
+**Pods fail to start with "must specify resource limits"**
+- This can happen if resource defaults are not yet applied in a newly created project
+- Check the Project status and LimitRange, then retry after reconciliation
+- If it persists, confirm your organization has an active subscription
+
+**Add-on added but quota did not increase**
+- Confirm that the provider reports the add-on and the subscription is `active`
+- Refresh the page after the Organization quota has reconciled
+
+**Cannot switch to a lower plan ("usage exceeds target plan")**
+- **Resource usage** on **Billing & quotas** shows current usage for each resource
+- Scale down or delete workloads until usage falls within the target plan's limits, then retry
+
+**IPv4 at 100%: you cannot create a LoadBalancer Service**
+- Compare the public IPv4 quota of each plan on the **Plans** tab
+- Choose a plan with more addresses, or ask your provider
+
+**Workloads were scaled to zero unexpectedly**
+- Check the subscription status in the **Subscription** panel
+- The organization may have entered `canceled` state after the 7-day grace period
+- Re-subscribe to restore all workloads automatically

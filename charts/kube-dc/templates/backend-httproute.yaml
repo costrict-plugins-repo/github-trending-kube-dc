@@ -1,0 +1,86 @@
+{{- $fullName := include "kube-dc.backend.fullname" . -}}
+{{- $svcPort := .Values.backend.service.port -}}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- include "kube-dc.backend.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+  - name: {{ .Values.backend.gateway.parentRef.name | default "eg" }}
+    namespace: {{ .Values.backend.gateway.parentRef.namespace | default "envoy-gateway-system" }}
+    sectionName: {{ .Values.backend.gateway.parentRef.sectionName | default "https-backend" }}
+  hostnames:
+  - {{ .Values.backend.gateway.hostname }}
+  rules:
+  # Project-console terminals and the console API's VM/SSH sockets hold a
+  # WebSocket open for the whole session (often many minutes / hours), so the
+  # 120s catch-all below would kill them with "upstream request timeout".
+  # Match these prefixes first with a much longer timeout. Gateway API rule
+  # matching prefers more specific PathPrefix, so this rule fires before the
+  # `/` catch-all.
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /api/project-console
+    - path:
+        type: PathPrefix
+        value: /api/ui/v1
+    timeouts:
+      request: {{ .Values.backend.gateway.longLivedTimeout | default "1h" | quote }}
+      backendRequest: {{ .Values.backend.gateway.longLivedTimeout | default "1h" | quote }}
+    backendRefs:
+    - name: {{ $fullName }}
+      port: {{ $svcPort }}
+  {{- $mcp := .Values.backend.mcp | default dict }}
+  {{- $mcpURL := urlParse (include "kube-dc.mcp.publicURL" .) }}
+  {{- if and $mcp.enabled (eq $mcpURL.host .Values.backend.gateway.hostname) $mcpURL.path }}
+  # The hosted MCP endpoint and its Protected Resource Metadata (RFC 9728:
+  # the well-known segment sits between the host and the path).
+  - matches:
+    - path:
+        type: PathPrefix
+        value: {{ $mcpURL.path | quote }}
+    - path:
+        type: PathPrefix
+        value: {{ printf "/.well-known/oauth-protected-resource%s" $mcpURL.path | quote }}
+    timeouts:
+      request: {{ .Values.backend.gateway.requestTimeout | default "120s" | quote }}
+      backendRequest: {{ .Values.backend.gateway.requestTimeout | default "120s" | quote }}
+    backendRefs:
+    - name: {{ $fullName }}-mcp
+      port: {{ $mcp.port | default 8090 }}
+  {{- end }}
+  {{- if include "kube-dc.backend.grafanaDedicated" . }}
+  # Grafana UID launches keep a per-user grant on the dedicated replica, and
+  # backend.dedicatedReplica.paths use its volumes.
+  - matches:
+    {{- range ((.Values.backend.dedicatedReplica | default dict).paths) }}
+    - path:
+        type: PathPrefix
+        value: {{ . | quote }}
+    {{- end }}
+    - path:
+        type: PathPrefix
+        value: /api/observability/grafana/
+    timeouts:
+      request: {{ .Values.backend.gateway.requestTimeout | default "120s" | quote }}
+      backendRequest: {{ .Values.backend.gateway.requestTimeout | default "120s" | quote }}
+    backendRefs:
+    - name: {{ $fullName }}-grafana
+      port: {{ $svcPort }}
+  {{- end }}
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    # Org self-registration creates a Keycloak realm + CRs and can take ~30s.
+    # Envoy's default request timeout (15s) resets the client mid-request, so
+    # the browser sees a failed POST /api/register/org even though it succeeds.
+    timeouts:
+      request: {{ .Values.backend.gateway.requestTimeout | default "120s" | quote }}
+      backendRequest: {{ .Values.backend.gateway.requestTimeout | default "120s" | quote }}
+    backendRefs:
+    - name: {{ $fullName }}
+      port: {{ $svcPort }}

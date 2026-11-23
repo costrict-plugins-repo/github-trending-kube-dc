@@ -1,0 +1,74 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kube-dc-kubectl
+  namespace: shalb-demo
+  labels:
+    app: kube-dc
+    component: kubectl
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 2
+  template:
+    metadata:
+      labels:
+        app: kube-dc
+        component: kubectl
+        service: kubectl-console
+    spec:
+      terminationGracePeriodSeconds: 2
+      containers:
+      - name: kubectl
+        image: shalb/kube-dc-kubectl:v0.5.2
+        ports:
+        - containerPort: 7681
+          name: ttyd
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 7681
+          initialDelaySeconds: 4
+          periodSeconds: 2
+          timeoutSeconds: 2
+          failureThreshold: 8
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 7681
+          initialDelaySeconds: 4
+          periodSeconds: 2
+          timeoutSeconds: 2
+          failureThreshold: 8
+        env:
+        - name: KEYCLOAK_ENDPOINT
+          value: "https://login.dev.kube-dc.com"
+        - name: ORGANIZATION
+          value: "shalb"
+        - name: REFRESH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: kube-dc-secret
+              key: refresh_token
+        - name: SERVER_ENDPOINT
+          value: "https://kube-api.dev.kube-dc.com:6443"
+        - name: CLUSTER_NAME
+          value: "shalb"
+        - name: USER_NAME
+          value: "arti"
+        - name: COMMAND
+          value: "kubectl_console"
+        - name: ONCE
+          value: "true"
+        volumeMounts:
+        - name: token-cache
+          mountPath: /tmp
+      volumes:
+      - name: token-cache
+        emptyDir:
+          medium: Memory
+          sizeLimit: 1Mi
+      restartPolicy: Never
+      # securityContext:
+      #   runAsNonRoot: false
+      #   runAsUser: 0

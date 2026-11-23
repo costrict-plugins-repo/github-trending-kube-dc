@@ -1,0 +1,17 @@
+apiVersion: kube-dc.com/v1
+kind: Project
+metadata:
+  name: "{project}"
+  namespace: "{organization}"          # Organization API namespace
+spec:
+  # Optional Project VPC subnet; omit it and the platform allocates a free
+  # block. Set it only for a range that must not overlap networks these
+  # workloads need to reach.
+  # cidrBlock: "{project-cidr}"
+
+  # Required and immutable: cloud | public
+  # public is accepted only when the provider has enabled public Projects.
+  egressNetworkType: cloud
+
+  # Optional. Normally let the platform select the gateway address.
+  # gwLanIp: {gateway-address}

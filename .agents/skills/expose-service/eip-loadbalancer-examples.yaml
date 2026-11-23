@@ -1,0 +1,71 @@
+# Direct public EIP examples. Confirm the provider offers public EIPs and check
+# Organization publicIPv4 quota before applying.
+apiVersion: kube-dc.com/v1
+kind: EIp
+metadata:
+  name: "{eip}"
+  namespace: "{project-backing-namespace}"
+spec:
+  externalNetworkType: public
+---
+# SSH Service bound to the named EIP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: "{vm}-ssh"
+  namespace: "{project-backing-namespace}"
+  annotations:
+    service.nlb.kube-dc.com/bind-on-eip: "{eip}"
+spec:
+  type: LoadBalancer
+  selector:
+    vm.kubevirt.io/name: "{vm}"
+  ports:
+    - name: ssh
+      port: 22
+      targetPort: 22
+      protocol: TCP
+---
+# Mixed UDP/TCP game-server ports sharing the same EIP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: game-server
+  namespace: "{project-backing-namespace}"
+  annotations:
+    service.nlb.kube-dc.com/bind-on-eip: "{eip}"
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: game-server
+  ports:
+    - name: game
+      port: 27015
+      targetPort: 27015
+      protocol: UDP
+    - name: rcon
+      port: 27016
+      targetPort: 27016
+      protocol: TCP
+---
+# Multi-port TCP Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: custom-tcp
+  namespace: "{project-backing-namespace}"
+  annotations:
+    service.nlb.kube-dc.com/bind-on-eip: "{eip}"
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: custom-app
+  ports:
+    - name: primary
+      port: 5000
+      targetPort: 5000
+      protocol: TCP
+    - name: secondary
+      port: 5001
+      targetPort: 5001
+      protocol: TCP

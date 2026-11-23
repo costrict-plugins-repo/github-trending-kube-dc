@@ -1,0 +1,267 @@
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: demo
+  namespace: shalb-dev
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks:
+      - 10.243.0.0/16
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KThreesControlPlane
+    name: demo-control-plane
+    namespace: shalb-dev
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+    kind: KubevirtCluster
+    name: demo
+    namespace: shalb-dev
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: KubevirtCluster
+metadata:
+  name: demo
+  namespace: shalb-dev
+spec:
+  controlPlaneEndpoint:
+    host: 168.119.17.51
+    port: 6443
+  controlPlaneServiceTemplate:
+    spec:
+      type: ClusterIP
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: KubevirtMachineTemplate
+metadata:
+  name: demo-control-plane
+  namespace: shalb-dev
+spec:
+  template:
+    spec:
+      virtualMachineBootstrapCheck:
+        checkStrategy: none
+      virtualMachineTemplate:
+        metadata:
+          namespace: shalb-dev
+        spec:
+          dataVolumeTemplates:
+          - metadata:
+              name: demo-dv
+            spec:
+              pvc:
+                accessModes:
+                - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: 30G
+                storageClassName: local-path
+              source:
+                http:
+                  url: https://cloud-images.ubuntu.com/minimal/daily/noble/current/noble-minimal-cloudimg-amd64.img
+          runStrategy: Always
+          template:
+            spec:
+              domain:
+                cpu:
+                  cores: 1
+                devices:
+                  disks:
+                  - disk:
+                      bus: virtio
+                    name: rootvolume
+                  interfaces:
+                  - bridge: {}
+                    name: ovn-vpc
+                  networkInterfaceMultiqueue: true
+                features:
+                  smm:
+                    enabled: true
+                firmware:
+                  bootloader:
+                memory:
+                  guest: 10Gi
+              evictionStrategy: External
+              networks:
+              - multus:
+                  default: true
+                  networkName: shalb-dev/default
+                name: ovn-vpc
+              readinessProbe:
+                failureThreshold: 10
+                guestAgentPing: {}
+                initialDelaySeconds: 40
+                periodSeconds: 10
+                timeoutSeconds: 5
+              accessCredentials:
+              - sshPublicKey:
+                  source:
+                    secret:
+                      secretName: authorized-keys-default
+                  propagationMethod:
+                    qemuGuestAgent:
+                      users:
+                      - capk
+              volumes:
+              - dataVolume:
+                  name: demo-dv
+                name: rootvolume
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KThreesControlPlane
+metadata:
+  name: demo-control-plane
+  namespace: shalb-dev
+spec:
+  infrastructureTemplate:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+    kind: KubevirtMachineTemplate
+    name: demo-control-plane
+    namespace: shalb-dev
+  kthreesConfigSpec:
+    agentConfig:
+      kubeletArgs:
+      - provider-id=kubevirt://{{ ds.meta_data.local_hostname }}
+      nodeName: '{{ ds.meta_data.local_hostname }}'
+    postK3sCommands:
+    - mkdir /run/cluster-api/
+    - until [ "$(curl -k https://127.0.0.1:6443/ping)" = "pong" ]; do sleep 5; done
+    - echo success > /run/cluster-api/bootstrap-success.complete
+    - rm /home/capk/.ssh/authorized_keys # Fix problem with dynamic SSH public key injection via qemu-guest-agent
+    - systemctl enable --now qemu-guest-agent
+    preK3sCommands:
+    - apt -y update
+    - apt -y install qemu-guest-agent
+    serverConfig:
+      disableExternalCloudProvider: true
+      kubeControllerManagerArgs: []
+  replicas: 3
+  version: v1.28.5+k3s1
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+kind: KubevirtMachineTemplate
+metadata:
+  name: demo-md-0
+  namespace: shalb-dev
+spec:
+  template:
+    spec:
+      virtualMachineBootstrapCheck:
+        checkStrategy: none
+      virtualMachineTemplate:
+        metadata:
+          namespace: shalb-dev
+        spec:
+          dataVolumeTemplates:
+          - metadata:
+              name: demo-dv
+            spec:
+              pvc:
+                accessModes:
+                - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: 30G
+                storageClassName: local-path
+              source:
+                http:
+                  url: https://cloud-images.ubuntu.com/minimal/daily/noble/current/noble-minimal-cloudimg-amd64.img
+          runStrategy: Always
+          template:
+            spec:
+              domain:
+                cpu:
+                  cores: 1
+                devices:
+                  disks:
+                  - disk:
+                      bus: virtio
+                    name: rootvolume
+                  interfaces:
+                  - bridge: {}
+                    name: ovn-vpc
+                  networkInterfaceMultiqueue: true
+                features:
+                  smm:
+                    enabled: true
+                firmware:
+                  bootloader:
+                    efi: {}
+                memory:
+                  guest: 8Gi
+              evictionStrategy: External
+              networks:
+              - multus:
+                  default: true
+                  networkName: shalb-dev/default
+                name: ovn-vpc
+              readinessProbe:
+                failureThreshold: 10
+                guestAgentPing: {}
+                initialDelaySeconds: 40
+                periodSeconds: 10
+                timeoutSeconds: 5
+              accessCredentials:
+              - sshPublicKey:
+                  source:
+                    secret:
+                      secretName: authorized-keys-default
+                  propagationMethod:
+                    qemuGuestAgent:
+                      users:
+                      - capk
+              volumes:
+              - dataVolume:
+                  name: demo-dv
+                name: rootvolume
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+kind: KThreesConfigTemplate
+metadata:
+  name: demo-md-0
+  namespace: shalb-dev
+spec:
+  template:
+    spec:
+      agentConfig:
+        kubeletArgs:
+        - provider-id=kubevirt://{{ ds.meta_data.local_hostname }}
+        nodeName: '{{ ds.meta_data.local_hostname }}'
+      postK3sCommands:
+      - mkdir /run/cluster-api/
+      - until [ "$(curl -k https://127.0.0.1:6444/ping)" = "pong" ]; do sleep 5; done
+      - echo success > /run/cluster-api/bootstrap-success.complete
+      - rm /home/capk/.ssh/authorized_keys
+      - systemctl enable --now qemu-guest-agent
+      preK3sCommands:
+      - apt -y update
+      - apt -y install qemu-guest-agent
+      serverConfig:
+        disableExternalCloudProvider: true
+---
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: demo-md-0
+  namespace: shalb-dev
+spec:
+  clusterName: demo
+  replicas: 3
+  selector:
+    matchLabels: null
+  template:
+    spec:
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+          kind: KThreesConfigTemplate
+          name: demo-md-0
+          namespace: shalb-dev
+      clusterName: demo
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1alpha1
+        kind: KubevirtMachineTemplate
+        name: demo-md-0
+        namespace: shalb-dev
+      version: v1.28.5+k3s1

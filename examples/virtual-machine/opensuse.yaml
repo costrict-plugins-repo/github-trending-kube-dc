@@ -1,0 +1,83 @@
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: suse-ssh-root
+  namespace: shalb-demo
+spec:
+  pvc:
+    accessModes:
+    - ReadWriteOnce
+    resources:
+      requests:
+        storage: 10G
+    storageClassName: local-path
+  source:
+    http:
+      url: https://download.opensuse.org/distribution/leap/15.3/appliances/openSUSE-Leap-15.3-JeOS.x86_64-OpenStack-Cloud.qcow2
+---
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: suse-ssh
+  namespace: shalb-demo
+spec:
+  runStrategy: Always
+  template:
+    spec:
+      networks:
+      - name: vpc_net_0
+        multus:
+          default: true
+          networkName: shalb-demo/default
+      domain:
+        devices:
+          interfaces:
+            - name: vpc_net_0
+              bridge: {}
+          disks:
+          - disk: 
+              bus: virtio
+            name: root-volume
+          - name: cloudinitdisk
+            disk:
+              bus: virtio
+        machine:
+          type: ""
+        cpu:
+          cores: 1
+        memory:
+          guest: 1G
+      readinessProbe:
+        guestAgentPing: {}
+        failureThreshold: 10
+        initialDelaySeconds: 30
+        periodSeconds: 10
+        timeoutSeconds: 5
+      accessCredentials:
+      - sshPublicKey:
+          source:
+            secret:
+              secretName: authorized-keys-default
+          propagationMethod:
+            qemuGuestAgent:
+              users:
+              - opensuse
+      terminationGracePeriodSeconds: 60
+      volumes:
+      - dataVolume:
+          name: suse-ssh-root
+        name: root-volume
+      - name: cloudinitdisk
+        cloudInitNoCloud:
+          userData: |-
+            #cloud-config
+            package_update: true
+            package_upgrade: true
+            packages:
+            - qemu-guest-agent
+            runcmd:
+            - set enforce 0 sestatus
+            - touch /tmp/healthy.txt
+            - chcon -t virt_qemu_ga_exec_t /tmp/healthy.txt
+            - setsebool -P virt_qemu_ga_manage_ssh 1
+            - systemctl enable --now qemu-guest-agent

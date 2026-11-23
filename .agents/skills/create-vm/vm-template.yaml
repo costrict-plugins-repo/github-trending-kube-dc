@@ -1,0 +1,95 @@
+# Linux cloud-image example. Replace every placeholder with values from the
+# live Kube-DC OS and storage catalogs. Use the VM wizard for Windows.
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: "{vm}-disk"
+  namespace: "{project-backing-namespace}"
+spec:
+  source:
+    registry:
+      url: "docker://{catalog-registry-image}@sha256:{digest}"
+      pullMethod: node
+  pvc:
+    accessModes:
+      - "{catalog-access-mode}"
+    # Set only when required by the selected StorageClass.
+    # volumeMode: Block
+    resources:
+      requests:
+        storage: "{catalog-minimum-or-larger}"
+    storageClassName: "{vm-storage-class}"
+---
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: "{vm}"
+  namespace: "{project-backing-namespace}"
+  labels:
+    app.kubernetes.io/name: "{vm}"
+spec:
+  running: true
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: "{vm}"
+    spec:
+      accessCredentials:
+        - sshPublicKey:
+            source:
+              secret:
+                secretName: authorized-keys-default
+            propagationMethod:
+              qemuGuestAgent:
+                users:
+                  - "{catalog-default-user}"
+      domain:
+        cpu:
+          cores: 2
+        memory:
+          guest: "{memory}"
+        devices:
+          disks:
+            - name: root
+              disk:
+                bus: virtio
+            - name: cloudinit
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              bridge: {}
+        # Explicit limits equal to the VM size. Without them KubeVirt sets the
+        # memory limit to about twice the request whenever the project quota
+        # limits memory, and a VM near the plan maximum is refused.
+        resources:
+          requests:
+            cpu: "2"
+            memory: "{memory}"
+          limits:
+            cpu: "2"
+            memory: "{memory}"
+      networks:
+        - name: default
+          multus:
+            default: true
+            networkName: "{project-backing-namespace}/default"
+      readinessProbe:
+        guestAgentPing: {}
+        initialDelaySeconds: 30
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 10
+      volumes:
+        - name: root
+          dataVolume:
+            name: "{vm}-disk"
+        - name: cloudinit
+          cloudInitNoCloud:
+            userData: |
+              #cloud-config
+              package_update: true
+              packages:
+                - qemu-guest-agent
+              runcmd:
+                - systemctl enable --now qemu-guest-agent

@@ -1,0 +1,208 @@
+---
+name: manage-cluster
+description: "Operate a Kube-DC Managed Cluster: download its external kubeconfig, scale or autoscale worker pools, perform supported upgrades, and inspect status."
+---
+
+## Prerequisites
+
+- The `KdcCluster` is Ready in a Kube-DC Project.
+- Know the Project's backing namespace: `{organization}-{project}`.
+- Check Organization and Project quota before adding workers.
+- Use values offered by the live dashboard/catalog for versions, worker images,
+  infrastructure providers, and storage.
+
+## Access the Managed Cluster
+
+For workstation access, read the dedicated external kubeconfig Secret:
+
+```bash
+umask 077
+kubectl get secret {cluster}-cp-admin-kubeconfig-external \
+  -n {backing-namespace} \
+  -o jsonpath='{.data.admin\.conf}' | base64 -d > /tmp/{cluster}-kubeconfig
+chmod 600 /tmp/{cluster}-kubeconfig
+
+kubectl --kubeconfig=/tmp/{cluster}-kubeconfig get nodes
+```
+
+The Secret exists only when external API exposure is enabled. If it is absent,
+use the console to enable exposure or an operator-approved private network path.
+Do not rewrite the kubeconfig server field and do not use the internal Kamaji or
+Cluster API Secrets as workstation substitutes.
+
+See [kubeconfig-access.md](kubeconfig-access.md).
+
+## Restrict Public API Clients
+
+On an operator-qualified installation, a ProjectInternal cluster accepts
+`spec.publicAPIAllowedCIDRs` with up to 32 IPv4 CIDRs. Confirm
+`spec.network.controlPlaneEndpointMode: ProjectInternal`; do not change that
+immutable topology on an existing cluster. External worker/API shared transport
+rejects restrictive lists. New clusters are open by default; removing the field
+or setting `[]` restores open public API intent without disabling exposure.
+
+Update the existing cluster manifest or use a current UID/resourceVersion-pinned
+patch. Verify the projected owned public API Service, current policy evidence,
+and authenticated access from allowed and denied sources with the real CA.
+Confirm private workers remain Ready. The REST exposure endpoint preserves the
+list when the parameter is omitted; `[]` explicitly clears it. Use the measured
+working worker MTU offered by the installation.
+
+## Scale a Worker Pool
+
+Inspect the current pool list before patching:
+
+```bash
+kubectl get kdccluster {cluster} -n {backing-namespace} \
+  -o jsonpath='{.spec.workers}' | jq
+```
+
+Patch only the intended replica field:
+
+```bash
+kubectl patch kdccluster {cluster} -n {backing-namespace} --type=json \
+  -p '[{"op":"replace","path":"/spec/workers/0/replicas","value":5}]'
+```
+
+A merge patch replaces the entire `workers` list and can silently discard
+pool settings. Use JSON Patch for individual fields. To append a pool, add a
+complete pool object at `/spec/workers/-`; copy the provider, storage, and
+image shape offered by the platform instead of inventing defaults.
+
+A pool can scale to zero only while another pool has Ready workers. The API
+prevents removal of the last Ready worker pool.
+
+See [scale-workers.md](scale-workers.md).
+
+## Autoscale
+
+Default mode adds `replicas` for unschedulable pods whose requests fit the
+pool; it never removes nodes:
+
+```bash
+kubectl patch kdccluster {cluster} -n {backing-namespace} --type=json -p '[
+  {"op":"add","path":"/spec/workers/0/autoscaling",
+   "value":{"enabled":true,"minReplicas":2,"maxReplicas":8}}
+]'
+```
+
+`mode: ClusterAutoscaler` hands the node count fully to the platform: nodes
+are added for pending pods AND removed after sitting idle (drained safely,
+PodDisruptionBudgets respected). Requires `minReplicas >= 1`; do not set
+`replicas` by hand in this mode — the platform owns it:
+
+```bash
+kubectl patch kdccluster {cluster} -n {backing-namespace} --type=json -p '[
+  {"op":"add","path":"/spec/workers/0/autoscaling",
+   "value":{"enabled":true,"mode":"ClusterAutoscaler",
+            "minReplicas":2,"maxReplicas":8,
+            "behavior":{"scaleDown":{"enabled":true}}}}
+]'
+```
+
+`behavior.scaleDown.enabled: false` keeps a pool grow-only even in this mode
+(per pool — one pool may shrink while a sibling never does).
+
+Keep `replicas` within `minReplicas` and `maxReplicas` (default mode). Inspect
+`.status.workerPools[].autoscaling` for the last scale reason and any limit
+such as quota, placement, maximum size, or a rolling update.
+
+## Expose a Service on a Project-Internal VIP
+
+A Managed Cluster Service can take a private VIP inside the Project VPC
+instead of a platform external IP: reachable from all Project workloads
+(VMs, platform pods, other Managed Clusters), never from outside the
+Project, and free of external-IP quota. Set both markers at creation:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: {name}
+  labels:
+    network.kube-dc.com/lb-pool: project
+spec:
+  type: LoadBalancer
+  loadBalancerClass: kube-dc.com/project
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+  selector:
+    app: {app}
+```
+
+Apply inside the Managed Cluster (not the Project namespace). The Service
+receives a VIP such as `10.242.0.208` from the cluster's delegated block
+(16 VIPs per block; raise `spec.loadBalancer.blocks` on the `KdcCluster`
+for more, 1–8).
+
+- Both the label and the class are required; without them the Service takes
+  the standard external-IP path instead.
+- Nothing to enable: VIP capacity is provisioned with the cluster. Do not
+  tell the user to request it from an operator.
+- KubeVirt-backed clusters only. Clusters on an external infrastructure
+  provider (such as CloudSigma) use that provider's LoadBalancer path.
+- No `externalTrafficPolicy: Local`, SCTP, or client source-IP
+  preservation; traffic arrives source-NATed.
+
+## Upgrade Kubernetes
+
+Use the dashboard's version selector as the source of truth. Upgrade one minor
+version at a time, never downgrade, and update every worker pool to the catalog
+image paired with the target control-plane version.
+
+```bash
+kubectl patch kdccluster {cluster} -n {backing-namespace} --type=json -p '[
+  {"op":"replace","path":"/spec/version","value":"{target-version}"},
+  {"op":"replace","path":"/spec/workers/0/image","value":"{paired-worker-image}"}
+]'
+```
+
+Include one image operation per worker pool. Do not derive an image tag from the
+Kubernetes version; use the exact live catalog value.
+
+See [upgrade-version.md](upgrade-version.md).
+
+## Managed Cluster etcd Encryption
+
+Enable the standard integration on `KdcCluster` rather than creating a key
+manually:
+
+```yaml
+spec:
+  encryption:
+    etcd:
+      enabled: true
+      kekRotation:
+        enabled: true
+        interval: 90d
+```
+
+When no explicit key reference is set, the platform creates and manages
+`{cluster}-etcd` in the same Project. Change its rotation policy through the
+`KdcCluster` spec. Do not delete or schedule deletion of this key while the
+Managed Cluster or its encrypted backups depend on it.
+
+## Monitor and Verify
+
+```bash
+kubectl get kdccluster {cluster} -n {backing-namespace} -w
+kubectl describe kdccluster {cluster} -n {backing-namespace}
+kubectl --kubeconfig=/tmp/{cluster}-kubeconfig get nodes
+```
+
+After scaling, compare Ready nodes with the sum of desired replicas. After an
+upgrade, verify both `spec.version` and each node's
+`.status.nodeInfo.kubeletVersion`. Completion time depends on images,
+placement, draining, and workload disruption budgets.
+
+## Safety
+
+- Never print kubeconfig contents; write them with mode `0600` and remove the
+  temporary file after use.
+- Check quota before scaling up.
+- Use JSON Patch for list entries.
+- Keep the last Ready worker pool.
+- Use only supported version and image pairs.
+- Manage an auto-created etcd KMS key through the `KdcCluster` spec.
